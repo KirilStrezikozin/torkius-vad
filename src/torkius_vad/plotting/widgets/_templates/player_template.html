@@ -1,0 +1,38 @@
+<div style="background-color: #f1f3f4">
+  <label id="time" style="color: black">0.000s</label>
+  <div id="{template.container_id}"></div>
+</div>
+
+<script type="module">
+  import WaveSurfer from {template.wavesurfer_js};
+  import ZoomPlugin from {template.wavesurfer_zoom_js};
+
+  const container = document.getElementById("{template.container_id}");
+  const ws = WaveSurfer.create({{
+    container,
+    waveColor: {template.wave_color},
+    progressColor: {template.progress_color},
+    cursorColor: {template.cursor_color},
+    height: {template.height},
+    responsive: true,
+    dragToSeek: true,
+    normalize: {template.normalize},
+    mediaControls: {template.media_controls},
+    minPxPerSec: 1,
+  }});
+
+  ws.registerPlugin(
+    ZoomPlugin.create({{
+      maxZoom: {template.max_zoom},
+      exponentialZooming: true,
+    }}),
+  )
+
+  ws.load({template.audio_url});
+
+  const timeLabel = document.getElementById("time");
+  ws.on("timeupdate", (value) => {{
+    timeLabel.textContent = value.toFixed(3) + "s";
+  }});
+</script>
+
