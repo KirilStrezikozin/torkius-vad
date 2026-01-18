@@ -7,6 +7,17 @@ WIP.
 - [x] Interactive `PlayerWidget` for audio visualization.
 - [x] Loading and resampling audio files.
 - [x] Probability teacher (pseudo-labelling) with Silero VAD.
+- [x] Static and interactive plotting of audio waveforms and VAD probabilities.
+- [x] Find and download datasets.
+- [ ] Save resampled audio array data loaded from datasets into `.npy` files.
+- [ ] Render dataset statistics.
+- [ ] Silence/non-silence teacher for speech-only datasets.
+- [ ] Save taught probabilities into `.npy` files.
+- [ ] Extract and stack features.
+- [ ] Save features to `.npz` files.
+- [ ] Arrange balanced training and testing splits.
+- [ ] Model training pipeline.
+- [ ] Model evaluation pipeline.
 
 """
 
@@ -34,7 +45,6 @@ from dataclasses import dataclass  # noqa: E402
 import numpy as np  # noqa: E402
 
 from torkius_vad.plotting.widgets import play  # noqa: E402
-
 
 # %%
 play("audio_file_550.wav")
@@ -86,13 +96,26 @@ class AbstractAudioLoader(ABC):
 
 
 class AudioLoader(AbstractAudioLoader):
+    def __init__(self, *, print_stats: bool = False) -> None:
+        self._print_stats = print_stats
+        self._load_n = 0
+        self._avg_load_time = 0.0
+
     def load(self, *, audio_data: AudioData) -> AudioData:
+        from time import time
+
         import soundfile as sf
 
         file_path = audio_data.file_path
         target_sr = audio_data.target_sr
 
+        s0 = time()
         audio, sample_rate = sf.read(file_path)
+
+        # Convert to mono.
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
         audio = audio.astype(np.float32)
         if sample_rate != target_sr:
             # Re-sample audio to target sample rate
@@ -104,6 +127,21 @@ class AudioLoader(AbstractAudioLoader):
                 target_sr=target_sr,
             )
             sample_rate = target_sr
+
+        s1 = time()
+
+        # Statistics.
+        self._load_n += 1
+        self._avg_load_time = (
+            (self._load_n - 1) * self._avg_load_time + (s1 - s0)
+        ) / self._load_n
+
+        if self._print_stats:
+            print(f"Loaded audio file '{file_path}' in {s1 - s0:.3f}s.")
+            print(
+                f"Average loading time over {self._load_n} runs: "
+                f"{self._avg_load_time:.3f}s.",
+            )
 
         return audio_data.with_audio(audio=audio, sr=sample_rate)
 
@@ -126,6 +164,7 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
         min_silence_at_max_speech: int = 98,
         use_max_poss_sil_at_max_speech: bool = True,
         pad_end_chunk_offset: int = -400,
+        print_stats: bool = False,
     ) -> None:
         """
         Args:
@@ -138,7 +177,10 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
             min_silence_at_max_speech: Minimum silence duration in ms used to avoid abrupt cuts when max_speech_duration_s is reached.
             use_max_poss_sil_at_max_speech: Whether to use the maximum possible silence at max_speech_duration_s or not. If not, the last silence is used.
             pad_end_chunk_offset: Offset in samples to pad the end of the audio chunk. Default is -400 samples to avoid trailing noise.
+            print_stats: Whether to print statistics about the VAD processing.
         """
+        from time import time
+
         import torch
 
         self._threshold = threshold
@@ -151,6 +193,14 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
         self._use_max_poss_sil_at_max_speech = use_max_poss_sil_at_max_speech
         self._pad_end_chunk_offset = pad_end_chunk_offset
 
+        # Statistics.
+        self._print_stats = print_stats
+        self._avg_init_n = 0
+        self._avg_init_time = 0.0
+        self._avg_teach_n = 0
+        self._avg_teach_time = 0.0
+
+        s0 = time()
         self._model, self._utils = torch.hub.load(
             repo_or_dir="snakers4/silero-vad",
             model="silero_vad",
@@ -172,8 +222,25 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
         self._model.to(self.device)
 
         self._proba_steps = np.array([0.0, 0.5, 1.0], dtype=np.float32)
+        s1 = time()
+
+        # Statistics.
+        self._avg_init_n += 1
+        self._avg_init_time = (
+            (self._avg_init_n - 1) * self._avg_init_time + (s1 - s0)
+        ) / self._avg_init_n
+
+        if self._print_stats:
+            print(f"Silero VAD model and teacher loaded in {s1 - s0:.3f}s.")
+            print(
+                f"Average initialization time over {self._avg_init_n} runs: "
+                f"{self._avg_init_time:.3f}s.",
+            )
 
     def teach(self, *, audio_data: AudioData) -> AudioData:
+        from time import time
+
+        import numpy as np
         import torch
         from silero_vad import get_speech_timestamps
 
@@ -188,6 +255,7 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
                 f"({self._pad_end_chunk_offset} % {audio_data.chunk_size} != 0).",
             )
 
+        s0 = time()
         audio = audio_data.audio
         audio_tensor = torch.from_numpy(audio).to(self.device)
 
@@ -229,19 +297,34 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
             taught_probas[c0:c1] = 1.0
 
         taught_probas = taught_probas[:: audio_data.chunk_size]
+        s1 = time()
+
+        # Statistics.
+        self._avg_teach_n += 1
+        self._avg_teach_time = (
+            (self._avg_teach_n - 1) * self._avg_teach_time + (s1 - s0)
+        ) / self._avg_teach_n
+
+        if self._print_stats:
+            print(f"Teaching with Silero VAD completed in {s1 - s0:.3f}s.")
+            print(
+                f"Average teaching time over {self._avg_teach_n} runs: "
+                f"{self._avg_teach_time:.3f}s.",
+            )
 
         return audio_data.with_taught_probas(taught_probas=taught_probas)
 
 
 # %%
+loader = AudioLoader(print_stats=True)
+teacher = SileroProbabilityTeacher(print_stats=True)
+
+# %%
 audio_data = AudioData(
-    file_path="audio_file_550.wav",
+    file_path="audio_file_713.wav",
     target_sr=8000,
     chunk_size=int(0.01 * 8000),  # 10 ms chunks
 )
-
-loader = AudioLoader()
-teacher = SileroProbabilityTeacher()
 
 loaded_audio_data = loader.load(audio_data=audio_data)
 taught_audio_data = teacher.teach(audio_data=loaded_audio_data)
@@ -297,7 +380,7 @@ class StaticPlotAudioVisualizer(AbstractAudioVisualizer):
         )
         ax2.set_ylabel("Speech Probability from Teacher")
 
-        plt.title("Waveform + Teacher VAD")
+        plt.title(f"{self._audio_data.file_path}: Waveform + Teacher VAD")
         plt.tight_layout()
         plt.show()
 
@@ -389,3 +472,36 @@ visualizer = AudioVisualizer(
 )
 
 visualizer.show()
+
+# %% [md]
+"""
+### Datasets
+
+Non-speech:
+
+1. ~[UrbanSound8K](https://soundata.readthedocs.io/en/latest/source/quick_reference.html): A dataset containing 8,732 labeled sound excerpts (<=4s) of urban sounds from 10 classes, such as air conditioner, car horn, children playing, dog bark, drilling, engine idling, gunshot, jackhammer, siren, and street music.~
+2. [ESC-50](https://github.com/karolpiczak/ESC-50): A labeled collection of 2,000 environmental audio recordings (5s) organized into 50 classes, including animals, natural soundscapes, human non-speech sounds, interior/domestic sounds, and exterior/urban noises.
+3. ~[TAU NIGENS SSE 2021](https://soundata.readthedocs.io/en/latest/source/quick_reference.html): Spatial sound-scene recordings, consisting of sound events of distinct categories in a variety of acoustical spaces, and from multiple source directions and distances, at varying signal-to-noise ratios (SNR) ranging from noiseless (30dB) to noisy (6dB) conditions.~
+
+Speech (clean, noisy):
+
+1. ~[LibriSpeech Clean](https://www.openslr.org/12): 100 hours of clean read English speech derived from audiobooks from the LibriVox project, suitable for training and evaluating speech recognition systems.~
+2. [Callhome German](https://huggingface.co/datasets/talkbank/callhome): A dataset of telephone conversations in German.
+3. [VoxConverse test](https://github.com/joonson/voxconverse): A dataset for speaker diarization in real-world scenarios, containing multi-speaker conversations with overlapping speech and background noise.
+
+Speech and non-speech:
+
+1. [AVA-Speech for VAD](https://huggingface.co/datasets/nccratliri/vad-human-ava-speech): AVA-Speech dataset customized for Human Speech Voice Activity Detection in WhisperSeg. The audio files were extracted from films.
+2. [MUSAN](https://huggingface.co/datasets/FluidInference/musan): A corpus of music, speech, and noise recordings suitable for training and evaluating voice activity detection (VAD) systems.
+3. Private telephony: A collection of telephony audio recordings containing both speech and non-speech segments, used for training and evaluating VAD systems in telecommunication applications.
+
+### Training
+
+Take all or a portion of each dataset for training.
+
+### Testing
+
+Take a portion from private telephony dataset not used in training.
+
+
+"""

@@ -14,6 +14,8 @@ class PlayerWidget:
     """
 
     class PlayerWidgetConfig:
+        title: str
+
         wavesurfer_js: str
         wavesurfer_zoom_js: str
         container_id: str
@@ -57,6 +59,8 @@ class PlayerWidget:
             media_controls (bool): Whether to show media controls.
             max_zoom (int): Maximum zoom level for the waveform.
         """
+
+        self._title = audio_url
 
         _wf_dist = "https://unpkg.com/wavesurfer.js@7/dist/"
         self._wavesurfer_js = f"{_wf_dist}wavesurfer.esm.js"
@@ -123,6 +127,7 @@ class PlayerWidget:
         template_html = self._template_path.read_text(encoding="utf-8")
 
         template = PlayerWidget.PlayerWidgetConfig(
+            title=json.dumps(self._title).strip('"'),
             wavesurfer_js=json.dumps(self._wavesurfer_js),
             wavesurfer_zoom_js=json.dumps(self._wavesurfer_zoom_js),
             container_id=json.dumps(self._container_id).strip('"'),
