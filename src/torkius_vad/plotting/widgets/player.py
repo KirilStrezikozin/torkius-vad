@@ -17,6 +17,7 @@ class PlayerWidget:
         wavesurfer_js: str
         wavesurfer_zoom_js: str
         container_id: str
+        time_id: str
         audio_url: str
 
         height: int
@@ -61,6 +62,7 @@ class PlayerWidget:
         self._wavesurfer_js = f"{_wf_dist}wavesurfer.esm.js"
         self._wavesurfer_zoom_js = f"{_wf_dist}plugins/zoom.esm.js"
         self._container_id = f"wavesurfer_{uuid.uuid4().hex}"
+        self._time_id = f"time_{uuid.uuid4().hex}"
         self._audio_url = self._get_audio_url(audio_url)
 
         self._height = height
@@ -124,6 +126,7 @@ class PlayerWidget:
             wavesurfer_js=json.dumps(self._wavesurfer_js),
             wavesurfer_zoom_js=json.dumps(self._wavesurfer_zoom_js),
             container_id=json.dumps(self._container_id).strip('"'),
+            time_id=json.dumps(self._time_id).strip('"'),
             audio_url=json.dumps(self._audio_url),
             height=self._height,
             max_zoom=self._max_zoom,
@@ -169,6 +172,9 @@ def play(
         normalize (bool): Whether to normalize the waveform.
         media_controls (bool): Whether to show media controls.
         max_zoom (int): Maximum zoom level for the waveform.
+
+    Returns:
+        DisplayHandle | None: Handle to the displayed output (if in Jupyter).
     """
     return PlayerWidget(
         audio_path,

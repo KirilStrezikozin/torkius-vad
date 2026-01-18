@@ -1,5 +1,5 @@
 <div style="background-color: #f1f3f4">
-  <label id="time" style="color: black">0.000s</label>
+  <label id="{template.time_id}" style="color: black">0.000s</label>
   <div id="{template.container_id}"></div>
 </div>
 
@@ -30,7 +30,7 @@
 
   ws.load({template.audio_url});
 
-  const timeLabel = document.getElementById("time");
+  const timeLabel = document.getElementById("{template.time_id}");
   ws.on("timeupdate", (value) => {{
     timeLabel.textContent = value.toFixed(3) + "s";
   }});
