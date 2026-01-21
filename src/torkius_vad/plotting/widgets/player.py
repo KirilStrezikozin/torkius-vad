@@ -38,6 +38,7 @@ class PlayerWidget:
         self,
         audio_url: str,
         *,
+        title: str | None = None,
         height: int = 200,
         wave_color: str = "#595959",
         progress_color: str = "#0b0b0b",
@@ -51,6 +52,7 @@ class PlayerWidget:
 
         Args:
             audio_url (str): Path to local audio file or URL.
+            title (str | None): Title of the audio track.
             height (int): Height of the waveform display in pixels.
             wave_color (str): Color of the waveform.
             progress_color (str): Color of the progress bar.
@@ -60,7 +62,10 @@ class PlayerWidget:
             max_zoom (int): Maximum zoom level for the waveform.
         """
 
-        self._title = audio_url
+        if title is None:
+            self._title = audio_url
+        else:
+            self._title = title
 
         _wf_dist = "https://unpkg.com/wavesurfer.js@7/dist/"
         self._wavesurfer_js = f"{_wf_dist}wavesurfer.esm.js"
@@ -157,6 +162,7 @@ class PlayerWidget:
 def play(
     audio_path: str,
     *,
+    title: str | None = None,
     height: int = 200,
     wave_color: str = "#595959",
     progress_color: str = "#0b0b0b",
@@ -170,6 +176,7 @@ def play(
 
     Args:
         audio_url (str): Path to local audio file or URL.
+        title (str | None): Title of the audio track.
         height (int): Height of the waveform display in pixels.
         wave_color (str): Color of the waveform.
         progress_color (str): Color of the progress bar.
@@ -183,6 +190,7 @@ def play(
     """
     return PlayerWidget(
         audio_path,
+        title=title,
         height=height,
         wave_color=wave_color,
         progress_color=progress_color,
