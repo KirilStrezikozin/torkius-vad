@@ -38,11 +38,17 @@ def _configure_plotly_classic() -> None:
 _configure_plotly_classic()  # If plotly charts don't render.
 
 # %%
+import torch
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
+# %%
 from abc import ABC, abstractmethod  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from enum import StrEnum  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import Literal, cast  # noqa: E402
+from typing import Generator, Literal, cast  # noqa: E402
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -492,6 +498,8 @@ class AudioData:
 
     taught_probas: np.ndarray | None = None
 
+    feat_vectors: np.ndarray | None = None
+
     def with_audio(self, *, audio: np.ndarray, sr: int) -> "AudioData":
         return AudioData(
             file_path=self.file_path,
@@ -510,6 +518,17 @@ class AudioData:
             audio=self.audio,
             sr=self.sr,
             taught_probas=taught_probas,
+        )
+
+    def with_feat_vectors(self, *, feat_vectors: np.ndarray) -> "AudioData":
+        return AudioData(
+            file_path=self.file_path,
+            target_sr=self.target_sr,
+            chunk_size=self.chunk_size,
+            audio=self.audio,
+            sr=self.sr,
+            taught_probas=self.taught_probas,
+            feat_vectors=feat_vectors,
         )
 
 
@@ -626,6 +645,7 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
         use_max_poss_sil_at_max_speech: bool = True,
         pad_end_chunk_offset: int = -400,
         print_stats: bool = False,
+        print_init_stats: bool = False,
     ) -> None:
         """
         Args:
@@ -639,6 +659,7 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
             use_max_poss_sil_at_max_speech: Whether to use the maximum possible silence at max_speech_duration_s or not. If not, the last silence is used.
             pad_end_chunk_offset: Offset in samples to pad the end of the audio chunk. Default is -400 samples to avoid trailing noise.
             print_stats: Whether to print statistics about the VAD processing.
+            print_init_stats: Whether to print statistics about the VAD model initialization.
         """
         from time import time
 
@@ -691,7 +712,7 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
             (self._avg_init_n - 1) * self._avg_init_time + (s1 - s0)
         ) / self._avg_init_n
 
-        if self._print_stats:
+        if self._print_stats or print_init_stats:
             print(f"Silero VAD model and teacher loaded in {s1 - s0:.3f}s.")
             print(
                 f"Average initialization time over {self._avg_init_n} runs: "
@@ -870,7 +891,9 @@ class MixAvaDatasetProbabilityTeacher(AbstractProbabilityTeacher):
 # %%
 class AbstractDatasetAudioLoader(ABC):
     @abstractmethod
-    def load(self, *, dataset_meta: DatasetMeta) -> list[AudioData]: ...
+    def load(
+        self, *, dataset_meta: DatasetMeta
+    ) -> Generator[AudioData, None, None]: ...
 
 
 class DatasetAudioLoader(AbstractDatasetAudioLoader):
@@ -895,24 +918,28 @@ class DatasetAudioLoader(AbstractDatasetAudioLoader):
         self._mmap_mode: Literal["r", "r+", "w+", "c"] | None = mmap_mode
         self._print_stats = print_stats
 
-    def load(self, *, dataset_meta: DatasetMeta) -> list[AudioData]:
+    def load(self, *, dataset_meta: DatasetMeta) -> Generator[AudioData, None, None]:
         from time import time
 
         datasets_dir = dataset_meta.dataset_path.parent
-        audio_data_list: list[AudioData] = []
         build = True
 
+        s0 = time()
         if self._use_disk_cache:
             build = False
-            s0 = time()
 
             if not self._cache_dir.exists():
                 self._cache_dir.mkdir(parents=True, exist_ok=True)
 
+            if self._print_stats:
+                print(
+                    f"Attempting to load {len(dataset_meta.dataset_meta)} audio files "
+                    f"from dataset '{dataset_meta.dataset_name}' cache...",
+                )
+
             for slug in dataset_meta.dataset_meta["Slug"]:
                 cached_audio_path = self._cache_dir / Path(slug).with_suffix(".npy")
                 if not cached_audio_path.exists():
-                    audio_data_list.clear()
                     build = True
                     if self._print_stats:
                         print(
@@ -921,6 +948,12 @@ class DatasetAudioLoader(AbstractDatasetAudioLoader):
                         )
                     break
 
+        took = time() - s0
+        if self._use_disk_cache and not build:
+            i = 0
+            for slug in dataset_meta.dataset_meta["Slug"]:
+                s0 = time()
+                cached_audio_path = self._cache_dir / Path(slug).with_suffix(".npy")
                 cached_audio = np.load(cached_audio_path, mmap_mode=self._mmap_mode)
                 audio_data = AudioData(
                     file_path=(datasets_dir / slug).as_posix(),
@@ -929,57 +962,74 @@ class DatasetAudioLoader(AbstractDatasetAudioLoader):
                     audio=cached_audio,
                     sr=self._target_sr,
                 )
-                audio_data_list.append(audio_data)
 
-            s1 = time()
+                i += 1
+                if self._print_stats:
+                    print(f"Loaded: {i + 1}/{len(dataset_meta.dataset_meta)}")
+
+                took += time() - s0
+                yield audio_data
+
             if not build and self._print_stats:
                 print(
-                    f"Loaded {len(audio_data_list)} audio files from dataset "
-                    f"'{dataset_meta.dataset_name}' cache in {s1 - s0:.3f}s."
+                    f"Loaded {i} audio files from dataset "
+                    f"'{dataset_meta.dataset_name}' cache in {took:.3f}s."
                 )
 
         if not build:
-            return audio_data_list
+            return
 
-        s0 = time()
+        if self._print_stats:
+            print(
+                f"Loading {len(dataset_meta.dataset_meta)} audio files from dataset "
+                f"'{dataset_meta.dataset_name}'...",
+            )
+
+        took = 0.0
+        i = 0
         for slug in dataset_meta.dataset_meta["Slug"]:
+            s0 = time()
             file_path = datasets_dir / slug
             audio_data = AudioData(
                 file_path=file_path.as_posix(),
                 target_sr=self._target_sr,
                 chunk_size=self._chunk_size,
             )
-            loaded_audio_data = self._audio_loader.load(audio_data=audio_data)
+            audio_data = self._audio_loader.load(audio_data=audio_data)
 
-            if loaded_audio_data.audio is None:
+            if audio_data.audio is None:
                 raise ValueError(
                     f"Loaded audio data from file '{file_path}' "
                     f"does not contain audio samples.",
                 )
-            elif loaded_audio_data.sr != self._target_sr:
+            elif audio_data.sr != self._target_sr:
                 # Because when loading from cache, we assume it's at target_sr.
                 raise ValueError(
                     f"Loaded audio data from file '{file_path}' "
                     f"has invalid sampling rate "
-                    f"({loaded_audio_data.sr} != {self._target_sr}).",
+                    f"({audio_data.sr} != {self._target_sr}).",
                 )
-
-            audio_data_list.append(loaded_audio_data)
 
             if self._use_disk_cache:
                 cached_audio_path = self._cache_dir / Path(slug).with_suffix(".npy")
                 if not cached_audio_path.parent.exists():
                     cached_audio_path.parent.mkdir(parents=True, exist_ok=True)
-                np.save(cached_audio_path, loaded_audio_data.audio, allow_pickle=False)
+                np.save(cached_audio_path, audio_data.audio, allow_pickle=False)
 
-        s1 = time()
+            i += 1
+            if self._print_stats:
+                print(f"Built: {i + 1}/{len(dataset_meta.dataset_meta)}")
+
+            took += time() - s0
+            yield audio_data
+
         if self._print_stats:
             print(
-                f"Loaded {len(audio_data_list)} audio files from dataset "
-                f"'{dataset_meta.dataset_name}' in {s1 - s0:.3f}s."
+                f"Loaded {i} audio files from dataset "
+                f"'{dataset_meta.dataset_name}' in {took:.3f}s."
             )
 
-        return audio_data_list
+        return
 
 
 # %%
@@ -989,8 +1039,8 @@ class AbstractDatasetAudioTeacher(ABC):
         self,
         *,
         dataset_meta: DatasetMeta,
-        audio_data_list: list[AudioData],
-    ) -> list[AudioData]: ...
+        audio_data_producer: Generator[AudioData, None, None],
+    ) -> Generator[AudioData, None, None]: ...
 
 
 class DatasetAudioTeacher(AbstractDatasetAudioTeacher):
@@ -1015,28 +1065,33 @@ class DatasetAudioTeacher(AbstractDatasetAudioTeacher):
         self,
         *,
         dataset_meta: DatasetMeta,
-        audio_data_list: list[AudioData],
-    ) -> list[AudioData]:
+        audio_data_producer: Generator[AudioData, None, None],
+    ) -> Generator[AudioData, None, None]:
         from time import time
 
         datasets_dir = dataset_meta.dataset_path.parent
-        taught_audio_data_list: list[AudioData] = []
         build = True
 
+        s0 = time()
         if self._use_disk_cache:
             build = False
-            s0 = time()
 
             if not self._cache_dir.exists():
                 self._cache_dir.mkdir(parents=True, exist_ok=True)
 
-            for audio_data in audio_data_list:
-                slug = Path(audio_data.file_path).relative_to(datasets_dir)
-                cached_probas_path = self._cache_dir / slug.with_stem(
-                    f"{slug.stem}_probas"
+            if self._print_stats:
+                print(
+                    f"Attempting to load taught probabilities for "
+                    f"{len(dataset_meta.dataset_meta)} audio files "
+                    f"from dataset '{dataset_meta.dataset_name}' cache...",
+                )
+
+            for slug in dataset_meta.dataset_meta["Slug"]:
+                slug_path = Path(slug)
+                cached_probas_path = self._cache_dir / slug_path.with_stem(
+                    f"{slug_path.stem}_probas"
                 ).with_suffix(".npy")
                 if not cached_probas_path.exists():
-                    taught_audio_data_list.clear()
                     build = True
                     if self._print_stats:
                         print(
@@ -1045,33 +1100,54 @@ class DatasetAudioTeacher(AbstractDatasetAudioTeacher):
                         )
                     break
 
+        took = time() - s0
+        if self._use_disk_cache and not build:
+            i = 0
+            for audio_data in audio_data_producer:
+                s0 = time()
+                slug = Path(audio_data.file_path).relative_to(datasets_dir)
+                cached_probas_path = self._cache_dir / slug.with_stem(
+                    f"{slug.stem}_probas"
+                ).with_suffix(".npy")
+
                 cached_probas = np.load(cached_probas_path, mmap_mode=self._mmap_mode)
                 taught_audio_data = audio_data.with_taught_probas(
                     taught_probas=cached_probas,
                 )
-                taught_audio_data_list.append(taught_audio_data)
 
-            s1 = time()
+                i += 1
+                if self._print_stats:
+                    print(f"Loaded: {i + 1}/{len(dataset_meta.dataset_meta)}")
+
+                took += time() - s0
+                yield taught_audio_data
+
             if not build and self._print_stats:
                 print(
                     f"Loaded taught probabilities for "
-                    f"{len(taught_audio_data_list)} audio files in dataset "
-                    f"'{dataset_meta.dataset_name}' cache in {s1 - s0:.3f}s."
+                    f"{i} audio files in dataset "
+                    f"'{dataset_meta.dataset_name}' cache in {took:.3f}s."
                 )
 
         if not build:
-            return taught_audio_data_list
+            return
 
-        s0 = time()
-        for audio_data in audio_data_list:
+        if self._print_stats:
+            print(
+                f"Teaching probabilities for {len(dataset_meta.dataset_meta)} audio files "
+                f"in dataset '{dataset_meta.dataset_name}'...",
+            )
+
+        took = 0.0
+        i = 0
+        for audio_data in audio_data_producer:
+            s0 = time()
             taught_audio_data = self._probability_teacher.teach(audio_data=audio_data)
             if taught_audio_data.taught_probas is None:
                 raise ValueError(
                     f"Taught audio data from file '{audio_data.file_path}' "
                     f"does not contain taught probabilities.",
                 )
-
-            taught_audio_data_list.append(taught_audio_data)
 
             if self._use_disk_cache:
                 slug = Path(audio_data.file_path).relative_to(datasets_dir)
@@ -1086,14 +1162,334 @@ class DatasetAudioTeacher(AbstractDatasetAudioTeacher):
                     allow_pickle=False,
                 )
 
+            i += 1
+            if self._print_stats:
+                print(f"Taught: {i + 1}/{len(dataset_meta.dataset_meta)}")
+
+            took += time() - s0
+            yield taught_audio_data
+
+        if self._print_stats:
+            print(
+                f"Taught probabilities for {i} audio files "
+                f"in dataset '{dataset_meta.dataset_name}' in {took:.3f}s."
+            )
+
+        return
+
+
+# %%
+class AbstractAudioFrameGenerator(ABC):
+    @abstractmethod
+    def generate(
+        self, *, audio_data: AudioData
+    ) -> Generator[np.ndarray, None, None]: ...
+
+
+class AudioFrameGenerator(AbstractAudioFrameGenerator):
+    def generate(self, *, audio_data: AudioData) -> Generator[np.ndarray, None, None]:
+        fmt_err = "Audio data must contain {} for frame generation."
+        if audio_data.audio is None:
+            raise ValueError(fmt_err.format("audio samples"))
+        elif audio_data.sr is None:
+            raise ValueError(fmt_err.format("sampling rate"))
+
+        audio = audio_data.audio
+        chunk_size = audio_data.chunk_size
+
+        num_chunks = len(audio) // chunk_size
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = start + chunk_size
+            yield audio[start:end]
+
+
+class AbstractAudioFeatureExtractor(ABC):
+    @abstractmethod
+    def extract(
+        self,
+        *,
+        audio_data: AudioData,
+        frame_generator: AbstractAudioFrameGenerator,
+    ) -> AudioData: ...
+
+
+class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
+    def __init__(
+        self,
+        hamming_window_size: int = 80,
+        n_fft: int = 80,
+        n_mfcc: int = 8,
+        eps: float = 1e-10,
+        print_stats: bool = False,
+    ) -> None:
+        """
+        Args:
+            hamming_window_size: Size of the Hamming window to apply to each frame.
+            n_fft: Number of FFT sample points.
+            eps: Small value to avoid log(0) and division by zero.
+            n_mfcc: Number of MFCC coefficients to extract.
+            print_stats: Whether to print statistics about the feature extraction.
+        """
+
+        self._hamming_window_size = hamming_window_size
+        self._window = np.hamming(self._hamming_window_size)
+        self._n_fft = n_fft
+        self._n_mfcc = n_mfcc
+        self._eps = eps
+        self._print_stats = print_stats
+
+        self._avg_extract_n = 0
+        self._avg_extract_time = 0.0
+
+    def extract(
+        self,
+        *,
+        audio_data: AudioData,
+        frame_generator: AbstractAudioFrameGenerator,
+    ) -> AudioData:
+        from time import time
+
+        fmt_err = "Audio data must contain {} for feature extraction."
+        if audio_data.audio is None:
+            raise ValueError(fmt_err.format("audio samples"))
+        elif audio_data.sr is None:
+            raise ValueError(fmt_err.format("sampling rate"))
+
+        s0 = time()
+        feat_vectors = []
+
+        prev_fft_spectrum = np.zeros(shape=(self._n_fft // 2 + 1,), dtype=np.float32)
+
+        for frame in frame_generator.generate(audio_data=audio_data):
+            feat_vec, prev_fft_spectrum = self._calc_feat_vec(
+                frame=frame,
+                sr=audio_data.sr,
+                prev_fft_spectrum=prev_fft_spectrum,
+            )
+            feat_vectors.append(feat_vec)
+
+        feat_vectors_array = np.vstack(feat_vectors).astype(np.float32)
+
         s1 = time()
         if self._print_stats:
             print(
-                f"Taught probabilities for {len(taught_audio_data_list)} audio files "
-                f"in dataset '{dataset_meta.dataset_name}' in {s1 - s0:.3f}s."
+                f"Extracted {len(feat_vectors_array)} feature vectors in {s1 - s0:.3f}s.",
             )
 
-        return taught_audio_data_list
+        # Statistics.
+        self._avg_extract_n += 1
+        self._avg_extract_time = (
+            (self._avg_extract_n - 1) * self._avg_extract_time + (s1 - s0)
+        ) / self._avg_extract_n
+
+        if self._print_stats:
+            print(
+                f"Average feature extraction time over "
+                f"{self._avg_extract_n} runs: "
+                f"{self._avg_extract_time:.3f}s.",
+            )
+
+        return audio_data.with_feat_vectors(feat_vectors=feat_vectors_array)
+
+    def _calc_feat_vec(
+        self,
+        *,
+        frame: np.ndarray,
+        sr: int,
+        prev_fft_spectrum: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        from scipy.fft import fft
+        import librosa
+
+        frame = frame * self._window
+
+        log_energy = np.log(np.sum(frame**2) + self._eps)
+        zcr = np.sum(np.abs(np.diff(np.sign(frame)))) / (2 * len(frame))
+
+        fft_spectrum = np.abs(fft(frame, n=self._n_fft))[: self._n_fft // 2 + 1]
+        fft_spectrum = fft_spectrum / (np.sum(fft_spectrum) + self._eps)
+        freqs = np.linspace(0, sr / 2, num=len(fft_spectrum))
+
+        centroid = np.sum(freqs * fft_spectrum)
+        bandwidth = np.sqrt(np.sum(((freqs - centroid) ** 2) * fft_spectrum))
+        flux = np.sum((fft_spectrum - prev_fft_spectrum) ** 2)
+        prev_fft_spectrum = fft_spectrum
+
+        mfcc = librosa.feature.mfcc(
+            y=frame,
+            sr=sr,
+            n_mfcc=self._n_mfcc,
+            n_fft=self._n_fft,
+            hop_length=len(frame),
+            win_length=len(frame),
+            n_mels=16,
+            fmax=sr / 2,
+        ).flatten()
+
+        feat_vec = np.hstack(
+            [
+                log_energy,
+                zcr,
+                centroid,
+                bandwidth,
+                flux,
+                mfcc,
+            ]
+        ).astype(np.float32)
+
+        return feat_vec, prev_fft_spectrum
+
+
+# %%
+class AbstractDatasetAudioFeatureExtractor(ABC):
+    @abstractmethod
+    def extract(
+        self,
+        *,
+        dataset_meta: DatasetMeta,
+        audio_data_producer: Generator[AudioData, None, None],
+    ) -> Generator[AudioData, None, None]: ...
+
+
+class DatasetAudioFeatureExtractor(AbstractDatasetAudioFeatureExtractor):
+    default_cache_dir: Path = Path().resolve().parent / "data" / "processed"
+
+    def __init__(
+        self,
+        *,
+        feature_extractor: AbstractAudioFeatureExtractor,
+        frame_generator: AbstractAudioFrameGenerator,
+        use_disk_cache: bool = True,
+        cache_dir: Path = default_cache_dir,
+        mmap_mode: Literal["r", "r+", "w+", "c"] | None = None,
+        print_stats: bool = True,
+    ) -> None:
+        self._feature_extractor = feature_extractor
+        self._frame_generator = frame_generator
+        self._use_disk_cache = use_disk_cache
+        self._cache_dir = cache_dir
+        self._mmap_mode: Literal["r", "r+", "w+", "c"] | None = mmap_mode
+        self._print_stats = print_stats
+
+    def extract(
+        self,
+        *,
+        dataset_meta: DatasetMeta,
+        audio_data_producer: Generator[AudioData, None, None],
+    ) -> Generator[AudioData, None, None]:
+        from time import time
+
+        datasets_dir = dataset_meta.dataset_path.parent
+        build = True
+
+        s0 = time()
+        if self._use_disk_cache:
+            build = False
+
+            if not self._cache_dir.exists():
+                self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+            if self._print_stats:
+                print(
+                    f"Attempting to load extracted features for "
+                    f"{len(dataset_meta.dataset_meta)} audio files "
+                    f"from dataset '{dataset_meta.dataset_name}' cache...",
+                )
+
+            for slug in dataset_meta.dataset_meta["Slug"]:
+                slug_path = Path(slug)
+                cached_feats_path = self._cache_dir / slug_path.with_stem(
+                    f"{slug_path.stem}_feats"
+                ).with_suffix(".npy")
+                if not cached_feats_path.exists():
+                    build = True
+                    if self._print_stats:
+                        print(
+                            f"Cache file '{cached_feats_path}' not found. "
+                            f"Rebuilding extracted features from source files...",
+                        )
+                    break
+
+        took = time() - s0
+        if self._use_disk_cache and not build:
+            i = 0
+            for audio_data in audio_data_producer:
+                s0 = time()
+                slug = Path(audio_data.file_path).relative_to(datasets_dir)
+                cached_feats_path = self._cache_dir / slug.with_stem(
+                    f"{slug.stem}_feats"
+                ).with_suffix(".npy")
+
+                cached_feats = np.load(cached_feats_path, mmap_mode=self._mmap_mode)
+                feat_audio_data = audio_data.with_feat_vectors(
+                    feat_vectors=cached_feats,
+                )
+
+                i += 1
+                if self._print_stats:
+                    print(f"Loaded: {i + 1}/{len(dataset_meta.dataset_meta)}")
+
+                took += time() - s0
+                yield feat_audio_data
+
+            if not build and self._print_stats:
+                print(
+                    f"Loaded extracted features for "
+                    f"{i} audio files in dataset "
+                    f"'{dataset_meta.dataset_name}' cache in {took:.3f}s."
+                )
+
+        if not build:
+            return
+
+        if self._print_stats:
+            print(
+                f"Extracting features for {len(dataset_meta.dataset_meta)} audio files "
+                f"in dataset '{dataset_meta.dataset_name}'...",
+            )
+
+        took = 0.0
+        i = 0
+        for audio_data in audio_data_producer:
+            s0 = time()
+            feat_audio_data = self._feature_extractor.extract(
+                audio_data=audio_data,
+                frame_generator=self._frame_generator,
+            )
+            if feat_audio_data.feat_vectors is None:
+                raise ValueError(
+                    f"Feature-extracted audio data from file '{audio_data.file_path}' "
+                    f"does not contain feature vectors.",
+                )
+
+            if self._use_disk_cache:
+                slug = Path(audio_data.file_path).relative_to(datasets_dir)
+                cached_feats_path = self._cache_dir / slug.with_stem(
+                    f"{slug.stem}_feats"
+                ).with_suffix(".npy")
+                if not cached_feats_path.parent.exists():
+                    cached_feats_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(
+                    cached_feats_path,
+                    feat_audio_data.feat_vectors,
+                    allow_pickle=False,
+                )
+
+            i += 1
+            if self._print_stats:
+                print(f"Extracted: {i + 1}/{len(dataset_meta.dataset_meta)}")
+
+            took += time() - s0
+            yield feat_audio_data
+
+        if self._print_stats:
+            print(
+                f"Extracted features for {i} audio files "
+                f"in dataset '{dataset_meta.dataset_name}' in {took:.3f}s."
+            )
+
+        return
 
 
 # %%
@@ -1101,7 +1497,7 @@ dataset_loader = DatasetAudioLoader(
     audio_loader=AudioLoader(print_stats=False),
     target_sr=8000,
     chunk_size=int(0.01 * 8000),  # 10 ms chunks
-    use_disk_cache=True,
+    use_disk_cache=False,
     print_stats=True,
 )
 
@@ -1112,43 +1508,156 @@ nonspeech_dataset_teacher = DatasetAudioTeacher(
 )
 
 mix_dataset_teacher = DatasetAudioTeacher(
-    probability_teacher=SileroProbabilityTeacher(print_stats=False),
+    probability_teacher=SileroProbabilityTeacher(
+        print_stats=False, print_init_stats=True
+    ),
     use_disk_cache=True,
     print_stats=True,
 )
 
-dataset_teachers = {
-    "mix_ava": None,
-    "mix_private_telephony": mix_dataset_teacher,
-    "mix_voxconverse_test": mix_dataset_teacher,
-    "nonspeech_esc_50": nonspeech_dataset_teacher,
-    "nonspeech_musan_music_rmf": nonspeech_dataset_teacher,
-    "nonspeech_musan_noise": nonspeech_dataset_teacher,
-    "speech_callhome_deu": None,
-    "speech_musan_speech": None,
-}
+dataset_feature_extractor = DatasetAudioFeatureExtractor(
+    feature_extractor=AudioFeatureExtractor(),
+    frame_generator=AudioFrameGenerator(),
+    use_disk_cache=True,
+    print_stats=True,
+)
 
 # %%
-datasets_meta.show(groups=False)
+audio_data = AudioData(
+    file_path="./audio_file_550.wav",
+    target_sr=8000,
+    chunk_size=int(0.01 * 8000),  # 10 ms chunks
+)
+
+audio_data = AudioLoader(print_stats=False).load(audio_data=audio_data)
+audio_data = SileroProbabilityTeacher(print_stats=True).teach(audio_data=audio_data)
+audio_data = AudioFeatureExtractor(print_stats=True).extract(
+    audio_data=audio_data,
+    frame_generator=AudioFrameGenerator(),
+)
+
 
 # %%
-audio_data_lists = {}
-for dataset_name, dataset_meta in dataset_metas.items():
-    dataset_teacher = dataset_teachers.get(dataset_name, None)
-    if dataset_teacher is None:
-        print("Skipping speech dataset for teaching probabilities.")
-        continue
+class AbstractDatasetAudioPipeline(ABC):
+    @abstractmethod
+    def process(
+        self,
+        *,
+        dataset_meta: DatasetMeta,
+        dataset_loader: AbstractDatasetAudioLoader,
+        dataset_teacher: AbstractDatasetAudioTeacher,
+        dataset_feature_extractor: AbstractDatasetAudioFeatureExtractor,
+    ) -> None: ...
 
-    audio_data_list = dataset_loader.load(
-        dataset_meta=dataset_meta,
-    )
 
-    audio_data_list = dataset_teacher.teach(
-        dataset_meta=dataset_meta,
-        audio_data_list=audio_data_list,
-    )
+class DatasetAudioPipeline(AbstractDatasetAudioPipeline):
+    def __init__(self, *, print_stats: bool = True) -> None:
+        self._print_stats = print_stats
 
-    audio_data_lists[dataset_name] = audio_data_list
+    def process(
+        self,
+        *,
+        dataset_meta: DatasetMeta,
+        dataset_loader: AbstractDatasetAudioLoader,
+        dataset_teacher: AbstractDatasetAudioTeacher,
+        dataset_feature_extractor: AbstractDatasetAudioFeatureExtractor,
+    ) -> None:
+        if self._print_stats:
+            print(f"\nProcessing dataset '{dataset_meta.dataset_name}':")
+
+        online_loader = dataset_loader.load(dataset_meta=dataset_meta)
+        online_teacher = dataset_teacher.teach(
+            dataset_meta=dataset_meta,
+            audio_data_producer=online_loader,
+        )
+        online_feature_extractor = dataset_feature_extractor.extract(
+            dataset_meta=dataset_meta,
+            audio_data_producer=online_teacher,
+        )
+
+        for _ in online_feature_extractor:
+            pass
+
+
+class DatasetAudioPipelineManager:
+    def __init__(
+        self,
+        *,
+        dataset_audio_pipeline: AbstractDatasetAudioPipeline,
+        dataset_metas: dict[str, DatasetMeta],
+        dataset_loader: AbstractDatasetAudioLoader,
+        dataset_teachers: dict[str, AbstractDatasetAudioTeacher],
+        dataset_feature_extractor: AbstractDatasetAudioFeatureExtractor,
+        only: set[str] | None = None,
+        verbose: int = 50,
+        n_jobs: int = -1,
+    ) -> None:
+        self._dataset_audio_pipeline = dataset_audio_pipeline
+        self._dataset_metas = dataset_metas
+        self._dataset_loader = dataset_loader
+        self._dataset_teachers = dataset_teachers
+        self._dataset_feature_extractor = dataset_feature_extractor
+        self._only = only
+        self._verbose = verbose
+        self._n_jobs = n_jobs
+
+    def run(self) -> None:
+        from joblib import Parallel, delayed
+
+        Parallel(
+            n_jobs=self._n_jobs,
+            backend="threading",
+            verbose=self._verbose,
+        )(
+            delayed(self._run_one)(dataset_meta=dataset_meta)
+            for dataset_meta in dataset_metas.values()
+        )
+
+    def _run_one(self, *, dataset_meta: DatasetMeta) -> None:
+        dataset_name = dataset_meta.dataset_name
+
+        if self._only is not None and dataset_name not in self._only:
+            print(f"\nSkipping dataset '{dataset_name}': not in 'only' list.")
+            return
+
+        if dataset_name not in self._dataset_teachers:
+            print(
+                f"\nSkipping dataset '{dataset_name}': no teacher available.",
+            )
+            return
+
+        self._dataset_audio_pipeline.process(
+            dataset_meta=dataset_meta,
+            dataset_loader=self._dataset_loader,
+            dataset_teacher=self._dataset_teachers[dataset_name],
+            dataset_feature_extractor=self._dataset_feature_extractor,
+        )
+
+
+# %%
+datasets_meta.show(groups=True)
+
+# %%
+dataset_audio_pipeline = DatasetAudioPipeline(print_stats=True)
+pipeline_manager = DatasetAudioPipelineManager(
+    dataset_audio_pipeline=dataset_audio_pipeline,
+    dataset_metas=dataset_metas,
+    dataset_loader=dataset_loader,
+    dataset_teachers={
+        "mix_ava": mix_dataset_teacher,
+        "mix_private_telephony": mix_dataset_teacher,
+        "mix_voxconverse_test": mix_dataset_teacher,
+        "nonspeech_esc_50": nonspeech_dataset_teacher,
+        "nonspeech_musan_music_rmf": nonspeech_dataset_teacher,
+        "nonspeech_musan_noise": nonspeech_dataset_teacher,
+        "speech_callhome_deu": mix_dataset_teacher,
+        "speech_musan_speech": mix_dataset_teacher,
+    },
+    dataset_feature_extractor=dataset_feature_extractor,
+    n_jobs=12,
+)
+
+pipeline_manager.run()
 
 
 # %%
@@ -1266,6 +1775,141 @@ class InteractivePlotAudioVisualizer(AbstractAudioVisualizer):
         fig.show()
 
 
+# %%
+class InteractiveFeatureVisualizer(AbstractAudioVisualizer):
+    def __init__(self, *, audio_data: AudioData) -> None:
+        fmt_err = "Audio data must contain {} for visualization."
+        if audio_data.audio is None:
+            raise ValueError(fmt_err.format("audio samples"))
+        elif audio_data.sr is None:
+            raise ValueError(fmt_err.format("sampling rate"))
+        elif audio_data.feat_vectors is None:
+            raise ValueError(fmt_err.format("feature vectors"))
+        self._audio_data = audio_data
+
+    def show(self) -> None:
+        import numpy as np
+        import plotly.graph_objects as go
+
+        assert self._audio_data.sr is not None
+        assert self._audio_data.audio is not None
+        assert self._audio_data.feat_vectors is not None
+
+        feat_vectors = self._audio_data.feat_vectors
+        audio = self._audio_data.audio
+        sr = self._audio_data.sr
+        frames = feat_vectors.shape[0]
+        frame_duration = self._audio_data.chunk_size / sr
+
+        t_audio = np.arange(len(audio)) / sr
+        t_frames = np.arange(frames) * frame_duration
+
+        fig = go.Figure()
+
+        fig.add_trace(
+            go.Scatter(
+                x=t_audio,
+                y=audio,
+                mode="lines",
+                name="Waveform",
+                line=dict(color="black", width=1),
+            )
+        )
+
+        labels = ["Centroid", "Bandwidth"]
+        colors = ["green", "orange"]
+        for i, (label, color) in enumerate(zip(labels, colors)):
+            fig.add_trace(
+                go.Scatter(
+                    x=t_frames,
+                    y=feat_vectors[:, i],
+                    mode="lines",
+                    name=label,
+                    line=dict(color=color, width=2),
+                    yaxis="y2",
+                    opacity=0.6,
+                )
+            )
+
+        labels = ["Log Energy", "ZCR", "Flux"]
+        colors = ["red", "blue", "purple"]
+        for i, (label, color) in enumerate(zip(labels, colors)):
+            fig.add_trace(
+                go.Scatter(
+                    x=t_frames,
+                    y=feat_vectors[:, i],
+                    mode="lines",
+                    name=label,
+                    line=dict(color=color, width=2),
+                    yaxis="y3",
+                    opacity=0.6,
+                )
+            )
+
+        fig.update_layout(
+            height=600,
+            xaxis=dict(title="Time (s)"),
+            yaxis=dict(title="Amplitude (Waveform)"),
+            yaxis2=dict(
+                title="Features",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+            ),
+            yaxis3=dict(
+                title="Features",
+                overlaying="y",
+                side="right",
+                position=0.95,
+                showgrid=False,
+            ),
+            legend=dict(x=0.01, y=0.99, bordercolor="Black", borderwidth=1),
+            title="Audio Waveform with Features",
+        )
+
+        fig.show()
+
+        fig_mfcc = go.Figure()
+
+        fig_mfcc.add_trace(
+            go.Scatter(
+                x=t_audio,
+                y=audio,
+                mode="lines",
+                name="Waveform",
+                line=dict(color="black", width=1),
+            )
+        )
+
+        fig_mfcc.add_trace(
+            go.Heatmap(
+                z=feat_vectors[:, 5 : 5 + 8].T,
+                x=t_frames,
+                y=np.arange(1, 9),
+                yaxis="y2",
+                colorscale="Viridis",
+                colorbar=dict(title="MFCC Coef"),
+                opacity=0.9,
+            )
+        )
+
+        fig_mfcc.update_layout(
+            height=600,
+            xaxis=dict(title="Time (s)"),
+            yaxis=dict(title="Amplitude (Waveform)"),
+            yaxis2=dict(
+                title="MFCC Index",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+            ),
+            legend=dict(x=0.01, y=0.99, bordercolor="Black", borderwidth=1),
+            title="Audio Waveform with MFCCs",
+        )
+
+        fig_mfcc.show()
+
+
 class PlayerWidgetAudioVisualizer(AbstractAudioVisualizer):
     def __init__(self, *, audio_data: AudioData) -> None:
         self._audio_data = audio_data
@@ -1291,9 +1935,10 @@ class AudioVisualizer(AbstractAudioVisualizer):
 
 # %%
 visualizer = AudioVisualizer(
-    StaticPlotAudioVisualizer(audio_data=taught_audio_data),
-    InteractivePlotAudioVisualizer(audio_data=taught_audio_data),
-    PlayerWidgetAudioVisualizer(audio_data=taught_audio_data),
+    StaticPlotAudioVisualizer(audio_data=audio_data),
+    InteractivePlotAudioVisualizer(audio_data=audio_data),
+    InteractiveFeatureVisualizer(audio_data=audio_data),
+    PlayerWidgetAudioVisualizer(audio_data=audio_data),
 )
 
 visualizer.show()
