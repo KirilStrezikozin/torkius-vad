@@ -13,10 +13,11 @@ WIP.
 - [x] Render all dataset metadata statistics.
 - [x] Render individual dataset metadata statistics with player.
 - [x] Save taught probabilities into `.npy` files.
-- [ ] Extract and stack features.
-- [ ] Save features to `.npz` files.
-- [ ] Arrange balanced training and testing splits.
-- [ ] Model training pipeline.
+- [x] Extract features
+- [x] Save features to `.npy` files.
+- [x] Stack features.
+- [x] Arrange balanced training and testing splits.
+- [x] Model training pipeline.
 - [ ] Model evaluation pipeline.
 """
 
@@ -38,7 +39,7 @@ def _configure_plotly_classic() -> None:
 _configure_plotly_classic()  # If plotly charts don't render.
 
 # %%
-import torch
+import torch  # noqa: E402
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
@@ -48,7 +49,7 @@ from abc import ABC, abstractmethod  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from enum import StrEnum  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import Generator, Literal, cast  # noqa: E402
+from typing import Any, Callable, Generator, Literal, NamedTuple, cast  # noqa: E402
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -288,7 +289,7 @@ class AbstractDatasetMeta(ABC):
 
     @property
     @abstractmethod
-    def dataset_meta(self) -> pd.DataFrame: ...
+    def dataset_meta(self) -> pd.DataFrame | pd.Series: ...
 
     @property
     @abstractmethod
@@ -306,6 +307,7 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
         dataset_name: str,
         datasets_meta: AbstractDatasetsMeta,
         use_disk_cache: bool = True,
+        dataset_mask: Any | None = None,
         print_stats: bool = True,
     ) -> None:
         from time import time
@@ -316,6 +318,7 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
         self._dataset_name = dataset_name
 
         self._dataset_type = self._get_dataset_type(dataset_name=dataset_name)
+        self._dataset_mask = dataset_mask
 
         dataset_path = self._datasets_meta.datasets_path / dataset_name
         self._check_dataset_path(path=dataset_path)
@@ -365,7 +368,9 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
         return self._dataset_name
 
     @property
-    def dataset_meta(self) -> pd.DataFrame:
+    def dataset_meta(self) -> pd.DataFrame | pd.Series:
+        if self._dataset_mask is not None:
+            return self._dataset_meta[self._dataset_mask]
         return self._dataset_meta
 
     @property
@@ -434,7 +439,7 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
             )
 
     def show(self) -> None:
-        display(self._dataset_meta)
+        display(self.dataset_meta)
 
     def show_player(self, *, random_n: int = 1) -> None:
         import random
@@ -500,6 +505,8 @@ class AudioData:
 
     feat_vectors: np.ndarray | None = None
 
+    predicted_probas: np.ndarray | None = None
+
     def with_audio(self, *, audio: np.ndarray, sr: int) -> "AudioData":
         return AudioData(
             file_path=self.file_path,
@@ -529,6 +536,18 @@ class AudioData:
             sr=self.sr,
             taught_probas=self.taught_probas,
             feat_vectors=feat_vectors,
+        )
+
+    def with_predicted_probas(self, *, predicted_probas: np.ndarray) -> "AudioData":
+        return AudioData(
+            file_path=self.file_path,
+            target_sr=self.target_sr,
+            chunk_size=self.chunk_size,
+            audio=self.audio,
+            sr=self.sr,
+            taught_probas=self.taught_probas,
+            feat_vectors=self.feat_vectors,
+            predicted_probas=predicted_probas,
         )
 
 
@@ -632,6 +651,13 @@ class NonSpeechProbabilityTeacher(AbstractProbabilityTeacher):
 
 
 class SileroProbabilityTeacher(AbstractProbabilityTeacher):
+    """
+    It is not safe to use a single instance of this teacher in multi-threaded
+    environments as the Silero VAD model is stateful. Ensure you use separate
+    independent instances of this class per thread or that the teacher is only
+    used for a single audio file at a time.
+    """
+
     def __init__(
         self,
         *,
@@ -778,7 +804,10 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
 
             taught_probas[c0:c1] = 1.0
 
+        num_chunks = len(audio) // audio_data.chunk_size
+        taught_probas = taught_probas[: num_chunks * audio_data.chunk_size]
         taught_probas = taught_probas[:: audio_data.chunk_size]
+
         s1 = time()
 
         # Statistics.
@@ -869,7 +898,10 @@ class MixAvaDatasetProbabilityTeacher(AbstractProbabilityTeacher):
 
             taught_probas[c0:c1] = 1.0
 
+        num_chunks = len(audio) // audio_data.chunk_size
+        taught_probas = taught_probas[: num_chunks * audio_data.chunk_size]
         taught_probas = taught_probas[:: audio_data.chunk_size]
+
         s1 = time()
 
         # Statistics.
@@ -963,9 +995,22 @@ class DatasetAudioLoader(AbstractDatasetAudioLoader):
                     sr=self._target_sr,
                 )
 
+                fmt_err = "Cached audio data must contain {}."
+                if audio_data.audio is None:
+                    raise ValueError(fmt_err.format("audio samples"))
+                elif audio_data.sr != self._target_sr:
+                    raise ValueError(
+                        f"Cached audio data from file '{cached_audio_path}' "
+                        f"has invalid sampling rate "
+                        f"({audio_data.sr} != {self._target_sr}).",
+                    )
+
                 i += 1
                 if self._print_stats:
-                    print(f"Loaded: {i + 1}/{len(dataset_meta.dataset_meta)}")
+                    print(
+                        f"Loaded audio (CACHE): {slug} ({i}/{len(dataset_meta.dataset_meta)}) "
+                        f"shape={audio_data.audio.shape}"
+                    )
 
                 took += time() - s0
                 yield audio_data
@@ -1003,7 +1048,6 @@ class DatasetAudioLoader(AbstractDatasetAudioLoader):
                     f"does not contain audio samples.",
                 )
             elif audio_data.sr != self._target_sr:
-                # Because when loading from cache, we assume it's at target_sr.
                 raise ValueError(
                     f"Loaded audio data from file '{file_path}' "
                     f"has invalid sampling rate "
@@ -1018,7 +1062,10 @@ class DatasetAudioLoader(AbstractDatasetAudioLoader):
 
             i += 1
             if self._print_stats:
-                print(f"Built: {i + 1}/{len(dataset_meta.dataset_meta)}")
+                print(
+                    f"Loaded audio: {slug} ({i}/{len(dataset_meta.dataset_meta)}) "
+                    f"shape={audio_data.audio.shape}"
+                )
 
             took += time() - s0
             yield audio_data
@@ -1115,9 +1162,41 @@ class DatasetAudioTeacher(AbstractDatasetAudioTeacher):
                     taught_probas=cached_probas,
                 )
 
+                fmt_err = "Cached taught audio data must contain {}."
+                if taught_audio_data.audio is None:
+                    raise ValueError(fmt_err.format("audio samples"))
+                elif taught_audio_data.taught_probas is None:
+                    raise ValueError(fmt_err.format("taught probabilities"))
+
                 i += 1
                 if self._print_stats:
-                    print(f"Loaded: {i + 1}/{len(dataset_meta.dataset_meta)}")
+                    print(
+                        f"Loaded taught (CACHE): {slug} ({i}/{len(dataset_meta.dataset_meta)})"
+                        f" shape={taught_audio_data.taught_probas.shape}"
+                    )
+
+                num_chunks = (
+                    len(taught_audio_data.audio) // taught_audio_data.chunk_size
+                )
+                if taught_audio_data.taught_probas.shape != (num_chunks,):
+                    taught_audio_data = taught_audio_data.with_taught_probas(
+                        taught_probas=taught_audio_data.taught_probas[:num_chunks]
+                    )
+                    assert taught_audio_data.taught_probas is not None
+
+                    # Re-save adjusted probabilities to cache.
+                    np.save(
+                        cached_probas_path,
+                        taught_audio_data.taught_probas,
+                        allow_pickle=False,
+                    )
+
+                    # Always print adjustment info in cache loading mode.
+                    print(
+                        f"Adjusted cached taught probabilities shape for "
+                        f"file '{cached_probas_path}' to "
+                        f"({num_chunks},)."
+                    )
 
                 took += time() - s0
                 yield taught_audio_data
@@ -1164,7 +1243,10 @@ class DatasetAudioTeacher(AbstractDatasetAudioTeacher):
 
             i += 1
             if self._print_stats:
-                print(f"Taught: {i + 1}/{len(dataset_meta.dataset_meta)}")
+                print(
+                    f"Taught: {audio_data.file_path} ({i}/{len(dataset_meta.dataset_meta)}) "
+                    f"shape={taught_audio_data.taught_probas.shape}"
+                )
 
             took += time() - s0
             yield taught_audio_data
@@ -1198,6 +1280,7 @@ class AudioFrameGenerator(AbstractAudioFrameGenerator):
         chunk_size = audio_data.chunk_size
 
         num_chunks = len(audio) // chunk_size
+        print(f"Generating {num_chunks} frames from audio of shape {audio.shape}.")
         for i in range(num_chunks):
             start = i * chunk_size
             end = start + chunk_size
@@ -1299,8 +1382,8 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
         sr: int,
         prev_fft_spectrum: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        from scipy.fft import fft
         import librosa
+        from scipy.fft import fft
 
         frame = frame * self._window
 
@@ -1339,6 +1422,47 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
         ).astype(np.float32)
 
         return feat_vec, prev_fft_spectrum
+
+
+# %%
+class AbstractFeatureWithContextStats(ABC):
+    @abstractmethod
+    def compute(self, *, feat_vec: np.ndarray) -> np.ndarray: ...
+
+    @abstractmethod
+    def reset(self) -> None: ...
+
+
+class FeatureWithContextStats(AbstractFeatureWithContextStats):
+    def __init__(self, *, context_size: int = 5) -> None:
+        from collections import deque
+
+        self._context_size = context_size
+        self._buf = deque(maxlen=context_size + 1)
+
+    def compute(self, *, feat_vec: np.ndarray) -> np.ndarray:
+        import numpy as np
+
+        self._buf.append(feat_vec)
+        buf_array = np.vstack(self._buf)
+
+        mean_vec = np.mean(buf_array, axis=0)
+        std_vec = np.std(buf_array, axis=0)
+        min_vec = np.min(buf_array, axis=0)
+        max_vec = np.max(buf_array, axis=0)
+
+        feat_with_stats = np.hstack(
+            [
+                mean_vec,
+                std_vec,
+                min_vec,
+                max_vec,
+            ]
+        ).astype(np.float32)
+        return feat_with_stats
+
+    def reset(self) -> None:
+        self._buf.clear()
 
 
 # %%
@@ -1426,9 +1550,16 @@ class DatasetAudioFeatureExtractor(AbstractDatasetAudioFeatureExtractor):
                     feat_vectors=cached_feats,
                 )
 
+                fmt_err = "Cached feature-extracted audio data must contain {}."
+                if feat_audio_data.feat_vectors is None:
+                    raise ValueError(fmt_err.format("feature vectors"))
+
                 i += 1
                 if self._print_stats:
-                    print(f"Loaded: {i + 1}/{len(dataset_meta.dataset_meta)}")
+                    print(
+                        f"Loaded features (CACHE): {slug} ({i}/{len(dataset_meta.dataset_meta)}) "
+                        f"shape={feat_audio_data.feat_vectors.shape}"
+                    )
 
                 took += time() - s0
                 yield feat_audio_data
@@ -1478,7 +1609,10 @@ class DatasetAudioFeatureExtractor(AbstractDatasetAudioFeatureExtractor):
 
             i += 1
             if self._print_stats:
-                print(f"Extracted: {i + 1}/{len(dataset_meta.dataset_meta)}")
+                print(
+                    f"Extracted: {audio_data.file_path} ({i}/{len(dataset_meta.dataset_meta)}) "
+                    f"shape={feat_audio_data.feat_vectors.shape}"
+                )
 
             took += time() - s0
             yield feat_audio_data
@@ -1501,39 +1635,32 @@ dataset_loader = DatasetAudioLoader(
     print_stats=True,
 )
 
-nonspeech_dataset_teacher = DatasetAudioTeacher(
-    probability_teacher=NonSpeechProbabilityTeacher(print_stats=False),
-    use_disk_cache=True,
-    print_stats=True,
-)
 
-mix_dataset_teacher = DatasetAudioTeacher(
-    probability_teacher=SileroProbabilityTeacher(
-        print_stats=False, print_init_stats=True
-    ),
-    use_disk_cache=True,
-    print_stats=True,
-)
+def make_nonspeech_dataset_teacher() -> DatasetAudioTeacher:
+    print("Creating Non-Speech Dataset Teacher...")
+    return DatasetAudioTeacher(
+        probability_teacher=NonSpeechProbabilityTeacher(print_stats=False),
+        use_disk_cache=True,
+        print_stats=True,
+    )
+
+
+def make_mix_dataset_teacher() -> DatasetAudioTeacher:
+    print("Creating Mix Dataset Teacher...")
+    return DatasetAudioTeacher(
+        probability_teacher=SileroProbabilityTeacher(
+            print_stats=False, print_init_stats=True
+        ),
+        use_disk_cache=True,
+        print_stats=True,
+    )
+
 
 dataset_feature_extractor = DatasetAudioFeatureExtractor(
     feature_extractor=AudioFeatureExtractor(),
     frame_generator=AudioFrameGenerator(),
     use_disk_cache=True,
     print_stats=True,
-)
-
-# %%
-audio_data = AudioData(
-    file_path="./audio_file_550.wav",
-    target_sr=8000,
-    chunk_size=int(0.01 * 8000),  # 10 ms chunks
-)
-
-audio_data = AudioLoader(print_stats=False).load(audio_data=audio_data)
-audio_data = SileroProbabilityTeacher(print_stats=True).teach(audio_data=audio_data)
-audio_data = AudioFeatureExtractor(print_stats=True).extract(
-    audio_data=audio_data,
-    frame_generator=AudioFrameGenerator(),
 )
 
 
@@ -1579,6 +1706,168 @@ class DatasetAudioPipeline(AbstractDatasetAudioPipeline):
             pass
 
 
+# %%
+class DatasetPartialLearningSamplesMetadata(NamedTuple):
+    samples_slug: str
+    samples_index: int
+    samples_total: int
+    is_train: bool
+    audio_data: AudioData
+
+
+class DatasetPartialLearningPipeline:
+    def __init__(self, *, print_stats: bool = True) -> None:
+        self._print_stats = print_stats
+
+    def process(
+        self,
+        *,
+        dataset_meta: DatasetMeta,
+        dataset_loader: AbstractDatasetAudioLoader,
+        dataset_teacher: AbstractDatasetAudioTeacher,
+        dataset_feature_extractor: AbstractDatasetAudioFeatureExtractor,
+        X_ctx: AbstractFeatureWithContextStats,
+        train_split: float,  # like 0.8 for 80% training data
+        skip_first: float = 0.0,  # like 0.1 to skip first 10% of data
+    ) -> Generator[
+        tuple[
+            np.ndarray,
+            np.ndarray,
+            DatasetPartialLearningSamplesMetadata,
+        ],
+        None,
+        None,
+    ]:
+        if self._print_stats:
+            print(f"\nProcessing dataset '{dataset_meta.dataset_name}':")
+
+        online_loader = dataset_loader.load(dataset_meta=dataset_meta)
+        online_teacher = dataset_teacher.teach(
+            dataset_meta=dataset_meta,
+            audio_data_producer=online_loader,
+        )
+        online_feature_extractor = dataset_feature_extractor.extract(
+            dataset_meta=dataset_meta,
+            audio_data_producer=online_teacher,
+        )
+
+        n_total = len(dataset_meta.dataset_meta)  # 632
+        first_i = int(skip_first * n_total)  # 0
+        n_effective = n_total - first_i  # 632
+        n_train = int(train_split * n_effective)  # 505
+        print(
+            f"Dataset '{dataset_meta.dataset_name}': "
+            f"total={n_total}, "
+            f"skip_first={first_i}, "
+            f"effective={n_effective}, "
+            f"train={n_train}, "
+            f"test={n_effective - n_train}.",
+        )
+
+        for i, audio_data in enumerate(online_feature_extractor):
+            if i < first_i:
+                X_ctx.reset()  # Reset context stats for next audio file.
+                continue
+
+            fmt_err = "Audio data must contain {} for final processing."
+            if audio_data.taught_probas is None:
+                raise ValueError(fmt_err.format("taught probabilities"))
+            elif audio_data.feat_vectors is None:
+                raise ValueError(fmt_err.format("feature vectors"))
+
+            X = np.array(
+                [
+                    X_ctx.compute(feat_vec=feat_vec)
+                    for feat_vec in audio_data.feat_vectors
+                ],
+                dtype=np.float32,
+            )
+            y = audio_data.taught_probas
+
+            effective_i = i - first_i
+            is_train = effective_i < n_train
+            sample_metadata = DatasetPartialLearningSamplesMetadata(
+                samples_slug=Path(audio_data.file_path)
+                .relative_to(dataset_meta.dataset_path.parent)
+                .as_posix(),
+                samples_index=effective_i,
+                samples_total=n_effective,
+                is_train=is_train,
+                audio_data=audio_data,
+            )
+
+            yield X, y, sample_metadata
+            X_ctx.reset()  # Reset context stats for next audio file.
+
+
+# %%
+from sklearn.linear_model import SGDClassifier  # noqa: E402
+from sklearn.preprocessing import StandardScaler  # noqa: E402
+
+
+class AbstractOfflinePredictor(ABC):
+    @abstractmethod
+    def predict(self, *, audio_data: AudioData) -> AudioData: ...
+
+
+class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
+    def __init__(
+        self,
+        *,
+        model: SGDClassifier,
+        scaler: StandardScaler,
+        X_ctx: AbstractFeatureWithContextStats,
+        print_stats: bool = True,
+    ) -> None:
+        self._model = model
+        self._scaler = scaler
+        self._X_ctx = X_ctx
+        self._print_stats = print_stats
+
+        self._avg_predict_n = 0
+        self._avg_predict_time = 0.0
+
+    def decision_function(self, *, X: np.ndarray) -> np.ndarray:
+        return self._model.decision_function(X)
+
+    def predict(self, *, audio_data: AudioData) -> AudioData:
+        fmt_err = "Audio data must contain {} for prediction."
+        if audio_data.feat_vectors is None:
+            raise ValueError(fmt_err.format("feature vectors"))
+
+        X = np.array(
+            [
+                self._X_ctx.compute(feat_vec=feat_vec)
+                for feat_vec in audio_data.feat_vectors
+            ],
+            dtype=np.float32,
+        )
+
+        s0 = time()
+        X = self._scaler.transform(X)
+        y_pred = self.decision_function(X=X)
+        s1 = time()
+
+        if self._print_stats:
+            print(f"Predicted probabilities in {s1 - s0:.3f}s.")
+
+        # Statistics.
+        self._avg_predict_n += 1
+        self._avg_predict_time = (
+            (self._avg_predict_n - 1) * self._avg_predict_time + (s1 - s0)
+        ) / self._avg_predict_n
+
+        if self._print_stats:
+            print(
+                f"Average prediction time over "
+                f"{self._avg_predict_n} runs: "
+                f"{self._avg_predict_time:.3f}s.",
+            )
+
+        return audio_data.with_predicted_probas(predicted_probas=y_pred)
+
+
+# %%
 class DatasetAudioPipelineManager:
     def __init__(
         self,
@@ -1586,7 +1875,7 @@ class DatasetAudioPipelineManager:
         dataset_audio_pipeline: AbstractDatasetAudioPipeline,
         dataset_metas: dict[str, DatasetMeta],
         dataset_loader: AbstractDatasetAudioLoader,
-        dataset_teachers: dict[str, AbstractDatasetAudioTeacher],
+        dataset_teacher_factories: dict[str, Callable[[], AbstractDatasetAudioTeacher]],
         dataset_feature_extractor: AbstractDatasetAudioFeatureExtractor,
         only: set[str] | None = None,
         verbose: int = 50,
@@ -1595,7 +1884,7 @@ class DatasetAudioPipelineManager:
         self._dataset_audio_pipeline = dataset_audio_pipeline
         self._dataset_metas = dataset_metas
         self._dataset_loader = dataset_loader
-        self._dataset_teachers = dataset_teachers
+        self._dataset_teacher_factories = dataset_teacher_factories
         self._dataset_feature_extractor = dataset_feature_extractor
         self._only = only
         self._verbose = verbose
@@ -1606,7 +1895,7 @@ class DatasetAudioPipelineManager:
 
         Parallel(
             n_jobs=self._n_jobs,
-            backend="threading",
+            backend="loky",
             verbose=self._verbose,
         )(
             delayed(self._run_one)(dataset_meta=dataset_meta)
@@ -1620,7 +1909,7 @@ class DatasetAudioPipelineManager:
             print(f"\nSkipping dataset '{dataset_name}': not in 'only' list.")
             return
 
-        if dataset_name not in self._dataset_teachers:
+        if dataset_name not in self._dataset_teacher_factories:
             print(
                 f"\nSkipping dataset '{dataset_name}': no teacher available.",
             )
@@ -1629,7 +1918,7 @@ class DatasetAudioPipelineManager:
         self._dataset_audio_pipeline.process(
             dataset_meta=dataset_meta,
             dataset_loader=self._dataset_loader,
-            dataset_teacher=self._dataset_teachers[dataset_name],
+            dataset_teacher=self._dataset_teacher_factories[dataset_name](),
             dataset_feature_extractor=self._dataset_feature_extractor,
         )
 
@@ -1643,21 +1932,136 @@ pipeline_manager = DatasetAudioPipelineManager(
     dataset_audio_pipeline=dataset_audio_pipeline,
     dataset_metas=dataset_metas,
     dataset_loader=dataset_loader,
-    dataset_teachers={
-        "mix_ava": mix_dataset_teacher,
-        "mix_private_telephony": mix_dataset_teacher,
-        "mix_voxconverse_test": mix_dataset_teacher,
-        "nonspeech_esc_50": nonspeech_dataset_teacher,
-        "nonspeech_musan_music_rmf": nonspeech_dataset_teacher,
-        "nonspeech_musan_noise": nonspeech_dataset_teacher,
-        "speech_callhome_deu": mix_dataset_teacher,
-        "speech_musan_speech": mix_dataset_teacher,
+    dataset_teacher_factories={
+        "mix_ava": make_mix_dataset_teacher,
+        "mix_private_telephony": make_mix_dataset_teacher,
+        "mix_voxconverse_test": make_mix_dataset_teacher,
+        "nonspeech_esc_50": make_nonspeech_dataset_teacher,
+        "nonspeech_musan_music_rmf": make_nonspeech_dataset_teacher,
+        "nonspeech_musan_noise": make_nonspeech_dataset_teacher,
+        "speech_callhome_deu": make_mix_dataset_teacher,
+        "speech_musan_speech": make_mix_dataset_teacher,
     },
     dataset_feature_extractor=dataset_feature_extractor,
-    n_jobs=12,
+    n_jobs=6,
 )
 
 pipeline_manager.run()
+
+# %%
+from sklearn.linear_model import SGDClassifier  # noqa: E402
+from sklearn.preprocessing import StandardScaler  # noqa: E402
+
+scaler = StandardScaler()
+clf = SGDClassifier(
+    loss="log_loss",
+    learning_rate="optimal",
+    alpha=1e-5,
+    penalty="elasticnet",
+    warm_start=True,
+)
+
+# %%
+from time import time  # noqa: E402
+
+X_ctx = FeatureWithContextStats(context_size=5)
+learner = DatasetPartialLearningPipeline(print_stats=True).process(
+    dataset_meta=dataset_metas["mix_private_telephony"],
+    dataset_loader=dataset_loader,
+    dataset_teacher=make_mix_dataset_teacher(),
+    dataset_feature_extractor=dataset_feature_extractor,
+    X_ctx=X_ctx,
+    train_split=0.8,
+    skip_first=0.0,
+)
+
+# %%
+data = []
+for X, y, sample_metadata in learner:
+    print(sample_metadata.is_train)
+    data.append((X, y, sample_metadata))
+
+# %%
+
+s0 = time()
+for X, y, sample_metadata in data:
+    if not sample_metadata.is_train:
+        continue
+
+    print(
+        f"Sample: {sample_metadata.samples_slug} "
+        f"({sample_metadata.samples_index + 1}/"
+        f"{sample_metadata.samples_total}) "
+        f"{'TRAIN' if sample_metadata.is_train else 'VAL'} "
+        f"X.shape={X.shape} y.shape={y.shape}",
+    )
+
+    t0 = time()
+    scaler.partial_fit(X)
+    X = scaler.transform(X)
+    clf.partial_fit(X, y, classes=[0.0, 1.0])
+    print(f"Fitted in {time() - t0:.3f}s.")
+print(f"Total learning time: {time() - s0:.3f}s.")
+
+# %%
+import pickle  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
+    pickle.dump(
+        {
+            "scaler": scaler,
+            "classifier": clf,
+            "comment": "SGDClassifier trained on 'mix_private_telephony' dataset.",
+        },
+        f,
+    )
+
+# %%
+pmeta = DatasetMeta(
+    dataset_name="mix_private_telephony",
+    datasets_meta=datasets_meta,
+    dataset_mask=(
+        dataset_metas["mix_private_telephony"].dataset_meta["Slug"]
+        == "mix_private_telephony/synthetic/audio_file_634.wav"
+    ),
+    print_stats=True,
+)
+
+DatasetAudioPipeline(print_stats=True).process(
+    dataset_meta=pmeta,
+    dataset_loader=dataset_loader,
+    dataset_teacher=make_mix_dataset_teacher(),
+    dataset_feature_extractor=dataset_feature_extractor,
+)
+
+# %%
+s0 = time()
+
+predictor = BaseOfflineSGDPredictor(
+    model=clf,
+    scaler=scaler,
+    X_ctx=X_ctx,
+    print_stats=True,
+)
+
+predicted = []
+for X, y, sample_metadata in data:
+    if sample_metadata.is_train:
+        continue
+
+    print(
+        f"Sample: {sample_metadata.samples_slug} "
+        f"({sample_metadata.samples_index + 1}/"
+        f"{sample_metadata.samples_total}) "
+        f"{'TRAIN' if sample_metadata.is_train else 'VAL'} "
+        f"X.shape={X.shape} y.shape={y.shape}",
+    )
+
+    predicted.append(predictor.predict(audio_data=sample_metadata.audio_data))
+
+
+print(f"Total prediction time: {time() - s0:.3f}s.")
 
 
 # %%
@@ -1714,6 +2118,19 @@ class StaticPlotAudioVisualizer(AbstractAudioVisualizer):
         )
         ax2.set_ylabel("Speech Probability from Teacher")
 
+        # Predicted probabilities.
+        if audio_data.predicted_probas is not None:
+            t_pred_proba = (
+                np.arange(len(audio_data.predicted_probas)) * audio_data.chunk_size
+            ) / sr
+            ax2.step(
+                t_pred_proba,
+                audio_data.predicted_probas,
+                color="red",
+                linewidth=1.2,
+                alpha=0.8,
+            )
+
         plt.title(f"{self._audio_data.file_path}: Waveform + Teacher VAD")
         plt.tight_layout()
         plt.show()
@@ -1761,6 +2178,21 @@ class InteractivePlotAudioVisualizer(AbstractAudioVisualizer):
                 yaxis="y2",
             )
         )
+
+        if audio_data.predicted_probas is not None:
+            t_pred_proba = (
+                np.arange(len(audio_data.predicted_probas)) * audio_data.chunk_size
+            ) / sr
+            fig.add_trace(
+                go.Scatter(
+                    x=t_pred_proba,
+                    y=audio_data.predicted_probas,
+                    mode="lines",
+                    name="Predicted Speech Probability",
+                    line=dict(shape="hv", color="red", width=1.2),
+                    yaxis="y2",
+                )
+            )
 
         fig.update_layout(
             height=500,
@@ -1934,6 +2366,9 @@ class AudioVisualizer(AbstractAudioVisualizer):
 
 
 # %%
+audio_data = predicted[-1]
+print(f"Visualizing sample: {audio_data.file_path}")
+
 visualizer = AudioVisualizer(
     StaticPlotAudioVisualizer(audio_data=audio_data),
     InteractivePlotAudioVisualizer(audio_data=audio_data),
