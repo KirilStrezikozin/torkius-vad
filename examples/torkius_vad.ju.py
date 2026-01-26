@@ -299,6 +299,9 @@ class AbstractDatasetMeta(ABC):
     @abstractmethod
     def dataset_type(self) -> DatasetType: ...
 
+    @abstractmethod
+    def shuffled(self, *, random_state: int | None = None) -> "AbstractDatasetMeta": ...
+
 
 class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
     def __init__(
@@ -313,6 +316,8 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
         from time import time
 
         self._datasets_meta = datasets_meta
+        self._use_disk_cache = use_disk_cache
+        self._print_stats = print_stats
 
         self._check_dataset_name(dataset_name=dataset_name)
         self._dataset_name = dataset_name
@@ -324,21 +329,21 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
         self._check_dataset_path(path=dataset_path)
         self._dataset_path = dataset_path
 
-        if use_disk_cache:
+        if self._use_disk_cache:
             try:
                 s0 = time()
                 self._dataset_meta = pd.read_csv(
                     self._dataset_path / "dataset_meta.csv",
                 )
                 s1 = time()
-                if print_stats:
+                if self._print_stats:
                     print(
                         f"Dataset '{dataset_name}' metadata loaded from disk "
                         f"cache in {s1 - s0:.3f}s.",
                     )
                 return
             except (FileNotFoundError, pd.errors.EmptyDataError):
-                if print_stats:
+                if self._print_stats:
                     print(
                         f"Disk cache for dataset '{dataset_name}' not found or "
                         f"invalid. Rebuilding metadata...",
@@ -348,7 +353,7 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
         self._dataset_meta = self._build_meta()
         s1 = time()
 
-        if print_stats:
+        if self._print_stats:
             print(f"Dataset '{dataset_name}' metadata built in {s1 - s0:.3f}s.")
 
         if use_disk_cache:
@@ -357,7 +362,7 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
                 self._dataset_path / "dataset_meta.csv", index=False
             )
             s1 = time()
-            if print_stats:
+            if self._print_stats:
                 print(
                     f"Dataset '{dataset_name}' metadata cached to disk in "
                     f"{s1 - s0:.3f}s.",
@@ -380,6 +385,23 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
     @property
     def dataset_type(self) -> DatasetType:
         return self._dataset_type
+
+    def shuffled(self, *, random_state: int | None = None) -> "DatasetMeta":
+        _dataset_meta_shuffled = self._dataset_meta.sample(
+            frac=1.0,
+            random_state=random_state,
+        ).reset_index(drop=True)
+
+        dataset_meta = DatasetMeta(
+            dataset_name=self._dataset_name,
+            datasets_meta=self._datasets_meta,
+            use_disk_cache=self._use_disk_cache,
+            dataset_mask=self._dataset_mask,
+            print_stats=self._print_stats,
+        )
+
+        dataset_meta._dataset_meta = _dataset_meta_shuffled
+        return dataset_meta
 
     def _check_dataset_name(self, *, dataset_name: str) -> None:
         if dataset_name not in self._datasets_meta.dataset_names:
@@ -1301,8 +1323,9 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
     def __init__(
         self,
         hamming_window_size: int = 80,
+        sr: int = 8000,
         n_fft: int = 80,
-        n_mfcc: int = 8,
+        n_mels: int = 12,
         eps: float = 1e-10,
         print_stats: bool = False,
     ) -> None:
@@ -1315,15 +1338,25 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
             print_stats: Whether to print statistics about the feature extraction.
         """
 
+        import librosa
+
         self._hamming_window_size = hamming_window_size
         self._window = np.hamming(self._hamming_window_size)
         self._n_fft = n_fft
-        self._n_mfcc = n_mfcc
+        self._n_mels = n_mels
         self._eps = eps
         self._print_stats = print_stats
 
         self._avg_extract_n = 0
         self._avg_extract_time = 0.0
+
+        self._mel_filter_bank = librosa.filters.mel(
+            sr=sr,
+            n_fft=self._n_fft,
+            n_mels=self._n_mels,
+            fmin=50.0,
+            fmax=sr / 2,
+        ).astype(np.float32)
 
     def extract(
         self,
@@ -1342,8 +1375,7 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
         s0 = time()
         feat_vectors = []
 
-        prev_fft_spectrum = np.zeros(shape=(self._n_fft // 2 + 1,), dtype=np.float32)
-
+        prev_fft_spectrum = None
         for frame in frame_generator.generate(audio_data=audio_data):
             feat_vec, prev_fft_spectrum = self._calc_feat_vec(
                 frame=frame,
@@ -1380,48 +1412,89 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
         *,
         frame: np.ndarray,
         sr: int,
-        prev_fft_spectrum: np.ndarray,
+        prev_fft_spectrum: np.ndarray | None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        import librosa
-        from scipy.fft import fft
+        from scipy.fft import rfft
 
         frame = frame * self._window
 
         log_energy = np.log(np.sum(frame**2) + self._eps)
-        zcr = np.sum(np.abs(np.diff(np.sign(frame)))) / (2 * len(frame))
+        zcr = np.mean(frame[:-1] * frame[1:] < 0.0)
 
-        fft_spectrum = np.abs(fft(frame, n=self._n_fft))[: self._n_fft // 2 + 1]
-        fft_spectrum = fft_spectrum / (np.sum(fft_spectrum) + self._eps)
+        fft_spectrum = np.abs(rfft(frame, n=self._n_fft)) + self._eps
+        fft_spectrum /= np.sum(fft_spectrum)
+
         freqs = np.linspace(0, sr / 2, num=len(fft_spectrum))
 
         centroid = np.sum(freqs * fft_spectrum)
-        bandwidth = np.sqrt(np.sum(((freqs - centroid) ** 2) * fft_spectrum))
-        flux = np.sum((fft_spectrum - prev_fft_spectrum) ** 2)
-        prev_fft_spectrum = fft_spectrum
+        flatness = np.exp(np.mean(np.log(fft_spectrum))) / (
+            np.mean(fft_spectrum) + self._eps
+        )
+        tonality = np.log(np.max(fft_spectrum) / (np.mean(fft_spectrum) + self._eps))
+        rolloff_idx = np.searchsorted(np.cumsum(fft_spectrum), 0.85)
+        rolloff_idx = min(rolloff_idx, len(freqs) - 1)
+        rolloff = freqs[rolloff_idx]
+        lf_energy = np.sum(fft_spectrum[freqs <= 300.0])
+        hf_energy = np.sum(fft_spectrum[freqs >= 300.0])
+        lf_ratio = lf_energy / (hf_energy + self._eps)
+        peaks = np.sum(fft_spectrum > 0.1 * np.max(fft_spectrum))
 
-        mfcc = librosa.feature.mfcc(
-            y=frame,
-            sr=sr,
-            n_mfcc=self._n_mfcc,
-            n_fft=self._n_fft,
-            hop_length=len(frame),
-            win_length=len(frame),
-            n_mels=16,
-            fmax=sr / 2,
-        ).flatten()
+        if prev_fft_spectrum is None:
+            flux = 0.0
+        else:
+            diff = fft_spectrum - prev_fft_spectrum
+            flux = (
+                np.sum(diff * diff) / (np.sum(prev_fft_spectrum**2) + self._eps)
+                + self._eps
+            )
+
+        mel_energy = self._mel_filter_bank @ fft_spectrum
+        log_mel_energy = np.log(mel_energy + self._eps)
 
         feat_vec = np.hstack(
             [
                 log_energy,
                 zcr,
                 centroid,
-                bandwidth,
+                flatness,
+                tonality,
+                rolloff,
+                lf_ratio,
+                peaks,
                 flux,
-                mfcc,
+                log_mel_energy,
             ]
         ).astype(np.float32)
 
-        return feat_vec, prev_fft_spectrum
+        return feat_vec, fft_spectrum
+
+
+# %%
+class Scaler:
+    def __init__(self, n_features: int):
+        self.n_features = n_features
+        self.count = 0
+        self.mean = np.zeros(n_features, dtype=np.float64)
+        self.M2 = np.zeros(
+            n_features, dtype=np.float64
+        )  # Sum of squares of differences
+
+    def partial_fit(self, X: np.ndarray) -> None:
+        for x in X:
+            self.count += 1
+            delta = x - self.mean
+            self.mean += delta / self.count
+            delta2 = x - self.mean
+            self.M2 += delta * delta2
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        std = np.sqrt(self.M2 / np.maximum(self.count - 1, 1))
+        std[std < 1e-8] = 1.0  # avoid division by zero
+        return (X - self.mean) / std
+
+    def fit_transform(self, X: np.ndarray) -> np.ndarray:
+        self.partial_fit(X)
+        return self.transform(X)
 
 
 # %%
@@ -1453,6 +1526,7 @@ class FeatureWithContextStats(AbstractFeatureWithContextStats):
 
         feat_with_stats = np.hstack(
             [
+                feat_vec,
                 mean_vec,
                 std_vec,
                 min_vec,
@@ -1712,6 +1786,7 @@ class DatasetPartialLearningSamplesMetadata(NamedTuple):
     samples_index: int
     samples_total: int
     is_train: bool
+    is_next_train: bool
     audio_data: AudioData
 
 
@@ -1775,6 +1850,7 @@ class DatasetPartialLearningPipeline:
             elif audio_data.feat_vectors is None:
                 raise ValueError(fmt_err.format("feature vectors"))
 
+            X_ctx.reset()
             X = np.array(
                 [
                     X_ctx.compute(feat_vec=feat_vec)
@@ -1782,10 +1858,12 @@ class DatasetPartialLearningPipeline:
                 ],
                 dtype=np.float32,
             )
+            X_ctx.reset()
             y = audio_data.taught_probas
 
             effective_i = i - first_i
             is_train = effective_i < n_train
+            is_next_train = (effective_i + 1) < n_train
             sample_metadata = DatasetPartialLearningSamplesMetadata(
                 samples_slug=Path(audio_data.file_path)
                 .relative_to(dataset_meta.dataset_path.parent)
@@ -1793,11 +1871,11 @@ class DatasetPartialLearningPipeline:
                 samples_index=effective_i,
                 samples_total=n_effective,
                 is_train=is_train,
+                is_next_train=is_next_train,
                 audio_data=audio_data,
             )
 
             yield X, y, sample_metadata
-            X_ctx.reset()  # Reset context stats for next audio file.
 
 
 # %%
@@ -1810,11 +1888,39 @@ class AbstractOfflinePredictor(ABC):
     def predict(self, *, audio_data: AudioData) -> AudioData: ...
 
 
+class AbstractPredictionModel(ABC):
+    @abstractmethod
+    def decision_function(self, *, X: np.ndarray) -> np.ndarray: ...
+
+
+class SGDClassifierModel(AbstractPredictionModel):
+    def __init__(self, *, model: SGDClassifier) -> None:
+        self._model = model
+
+    def decision_function(self, *, X: np.ndarray) -> np.ndarray:
+        return self._model.decision_function(X)
+
+
+class SGDEnsembleModel(AbstractPredictionModel):
+    def __init__(self, *, models: list[SGDClassifier]) -> None:
+        self._models = models
+
+    def decision_function(self, *, X: np.ndarray) -> np.ndarray:
+        import numpy as np
+
+        all_preds = np.array(
+            [model.decision_function(X) for model in self._models],
+            dtype=np.float32,
+        )
+        avg_preds = np.mean(all_preds, axis=0)
+        return avg_preds
+
+
 class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
     def __init__(
         self,
         *,
-        model: SGDClassifier,
+        model: AbstractPredictionModel,
         scaler: StandardScaler,
         X_ctx: AbstractFeatureWithContextStats,
         print_stats: bool = True,
@@ -1828,13 +1934,14 @@ class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
         self._avg_predict_time = 0.0
 
     def decision_function(self, *, X: np.ndarray) -> np.ndarray:
-        return self._model.decision_function(X)
+        return self._model.decision_function(X=X)
 
     def predict(self, *, audio_data: AudioData) -> AudioData:
         fmt_err = "Audio data must contain {} for prediction."
         if audio_data.feat_vectors is None:
             raise ValueError(fmt_err.format("feature vectors"))
 
+        self._X_ctx.reset()
         X = np.array(
             [
                 self._X_ctx.compute(feat_vec=feat_vec)
@@ -1842,6 +1949,7 @@ class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
             ],
             dtype=np.float32,
         )
+        self._X_ctx.reset()
 
         s0 = time()
         X = self._scaler.transform(X)
@@ -1953,54 +2061,200 @@ from sklearn.linear_model import SGDClassifier  # noqa: E402
 from sklearn.preprocessing import StandardScaler  # noqa: E402
 
 scaler = StandardScaler()
-clf = SGDClassifier(
-    loss="log_loss",
-    learning_rate="optimal",
-    alpha=1e-5,
-    penalty="elasticnet",
-    warm_start=True,
-)
+
+models = [
+    SGDClassifier(
+        loss="log_loss",
+        learning_rate="optimal",
+        alpha=1e-5,
+        penalty="l2",
+        warm_start=True,
+    )
+    for _ in range(5)
+]
 
 # %%
+
 from time import time  # noqa: E402
 
-X_ctx = FeatureWithContextStats(context_size=5)
-learner = DatasetPartialLearningPipeline(print_stats=True).process(
-    dataset_meta=dataset_metas["mix_private_telephony"],
-    dataset_loader=dataset_loader,
-    dataset_teacher=make_mix_dataset_teacher(),
-    dataset_feature_extractor=dataset_feature_extractor,
-    X_ctx=X_ctx,
-    train_split=0.8,
-    skip_first=0.0,
-)
+X_ctx = FeatureWithContextStats(context_size=5)  # One instance is safe.
+learning_pipeline = DatasetPartialLearningPipeline(print_stats=False)
+
+SKIP = True
+NOT_SKIP = False
+
+learners = {
+    "mix_ava": (
+        dataset_metas["mix_ava"],
+        NOT_SKIP,
+        learning_pipeline.process(
+            dataset_meta=dataset_metas["mix_ava"].shuffled(
+                random_state=42,
+            ),
+            dataset_loader=dataset_loader,
+            dataset_teacher=make_mix_dataset_teacher(),
+            dataset_feature_extractor=dataset_feature_extractor,
+            X_ctx=X_ctx,
+            train_split=0.9,
+            skip_first=0.0,
+        ),
+    ),
+    "mix_private_telephony": (
+        dataset_metas["mix_private_telephony"],
+        NOT_SKIP,
+        learning_pipeline.process(
+            dataset_meta=dataset_metas["mix_private_telephony"].shuffled(
+                random_state=42,
+            ),
+            dataset_loader=dataset_loader,
+            dataset_teacher=make_mix_dataset_teacher(),
+            dataset_feature_extractor=dataset_feature_extractor,
+            X_ctx=X_ctx,
+            train_split=0.9,
+            skip_first=0.0,
+        ),
+    ),
+    "mix_voxconverse_test": (
+        dataset_metas["mix_voxconverse_test"],
+        NOT_SKIP,
+        learning_pipeline.process(
+            dataset_meta=dataset_metas["mix_voxconverse_test"].shuffled(
+                random_state=42,
+            ),
+            dataset_loader=dataset_loader,
+            dataset_teacher=make_mix_dataset_teacher(),
+            dataset_feature_extractor=dataset_feature_extractor,
+            X_ctx=X_ctx,
+            train_split=0.9,
+            skip_first=0.0,
+        ),
+    ),
+    "nonspeech_esc_50": (
+        dataset_metas["nonspeech_esc_50"],
+        NOT_SKIP,
+        learning_pipeline.process(
+            dataset_meta=dataset_metas["nonspeech_esc_50"].shuffled(
+                random_state=42,
+            ),
+            dataset_loader=dataset_loader,
+            dataset_teacher=make_nonspeech_dataset_teacher(),
+            dataset_feature_extractor=dataset_feature_extractor,
+            X_ctx=X_ctx,
+            train_split=0.9,
+            skip_first=0.0,
+        ),
+    ),
+    "nonspeech_musan_music_rmf": (
+        dataset_metas["nonspeech_musan_music_rmf"],
+        NOT_SKIP,
+        learning_pipeline.process(
+            dataset_meta=dataset_metas["nonspeech_musan_music_rmf"].shuffled(
+                random_state=42,
+            ),
+            dataset_loader=dataset_loader,
+            dataset_teacher=make_nonspeech_dataset_teacher(),
+            dataset_feature_extractor=dataset_feature_extractor,
+            X_ctx=X_ctx,
+            train_split=0.9,
+            skip_first=0.0,
+        ),
+    ),
+    "nonspeech_musan_noise": (
+        dataset_metas["nonspeech_musan_noise"],
+        NOT_SKIP,
+        learning_pipeline.process(
+            dataset_meta=dataset_metas["nonspeech_musan_noise"].shuffled(
+                random_state=42,
+            ),
+            dataset_loader=dataset_loader,
+            dataset_teacher=make_nonspeech_dataset_teacher(),
+            dataset_feature_extractor=dataset_feature_extractor,
+            X_ctx=X_ctx,
+            train_split=0.9,
+            skip_first=0.0,
+        ),
+    ),
+    "speech_callhome_deu": (
+        dataset_metas["speech_callhome_deu"],
+        NOT_SKIP,
+        learning_pipeline.process(
+            dataset_meta=dataset_metas["speech_callhome_deu"].shuffled(
+                random_state=42,
+            ),
+            dataset_loader=dataset_loader,
+            dataset_teacher=make_mix_dataset_teacher(),
+            dataset_feature_extractor=dataset_feature_extractor,
+            X_ctx=X_ctx,
+            train_split=0.9,
+            skip_first=0.0,
+        ),
+    ),
+    "speech_musan_speech": (
+        dataset_metas["speech_musan_speech"],
+        NOT_SKIP,
+        learning_pipeline.process(
+            dataset_meta=dataset_metas["speech_musan_speech"].shuffled(
+                random_state=42,
+            ),
+            dataset_loader=dataset_loader,
+            dataset_teacher=make_mix_dataset_teacher(),
+            dataset_feature_extractor=dataset_feature_extractor,
+            X_ctx=X_ctx,
+            train_split=0.9,
+            skip_first=0.0,
+        ),
+    ),
+}
 
 # %%
-data = []
-for X, y, sample_metadata in learner:
-    print(sample_metadata.is_train)
-    data.append((X, y, sample_metadata))
+# data = []
+# for X, y, sample_metadata in learners["mix_private_telephony"]():
+#     print(sample_metadata.is_train)
+#     data.append((X, y, sample_metadata))
 
 # %%
 
 s0 = time()
-for X, y, sample_metadata in data:
-    if not sample_metadata.is_train:
+for dataset_meta, skip_dataset, learner in learners.values():
+    if skip_dataset:
+        print(f"\nSkipping dataset '{dataset_meta.dataset_name}'.")
         continue
 
     print(
-        f"Sample: {sample_metadata.samples_slug} "
-        f"({sample_metadata.samples_index + 1}/"
-        f"{sample_metadata.samples_total}) "
-        f"{'TRAIN' if sample_metadata.is_train else 'VAL'} "
-        f"X.shape={X.shape} y.shape={y.shape}",
+        f"\nLearning on dataset '{dataset_meta.dataset_name}' {dataset_meta.dataset_type}:"
     )
 
-    t0 = time()
-    scaler.partial_fit(X)
-    X = scaler.transform(X)
-    clf.partial_fit(X, y, classes=[0.0, 1.0])
-    print(f"Fitted in {time() - t0:.3f}s.")
+    for X, y, sample_metadata in learner:
+        # print(
+        #     f"Sample: {sample_metadata.samples_slug} "
+        #     f"({sample_metadata.samples_index + 1}/"
+        #     f"{sample_metadata.samples_total}) "
+        #     f"{'TRAIN' if sample_metadata.is_train else 'VAL'} "
+        #     f"X.shape={X.shape} y.shape={y.shape}",
+        # )
+
+        t0 = time()
+        if dataset_meta.dataset_type != DatasetType.NONSPEECH:
+            scaler.partial_fit(X)
+        X = scaler.transform(X)
+
+        for clf in models:
+            clf.partial_fit(X, y, classes=[0.0, 1.0])
+
+        # print(f"Fitted in {time() - t0:.3f}s.")
+        print(end="")
+        print(
+            f"{dataset_meta.dataset_name}: "
+            f"Sample {sample_metadata.samples_index + 1}/"
+            f"{sample_metadata.samples_total} ",
+            end="\r",
+        )
+
+        if not sample_metadata.is_next_train:
+            break
+
+    print("")
+
 print(f"Total learning time: {time() - s0:.3f}s.")
 
 # %%
@@ -2011,7 +2265,7 @@ with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
     pickle.dump(
         {
             "scaler": scaler,
-            "classifier": clf,
+            "classifier": models,
             "comment": "SGDClassifier trained on 'mix_private_telephony' dataset.",
         },
         f,
@@ -2039,29 +2293,66 @@ DatasetAudioPipeline(print_stats=True).process(
 s0 = time()
 
 predictor = BaseOfflineSGDPredictor(
-    model=clf,
+    # model=SGDClassifierModel(model=models[0]),
+    model=SGDEnsembleModel(models=models),
     scaler=scaler,
     X_ctx=X_ctx,
-    print_stats=True,
+    print_stats=False,
 )
 
 predicted = []
-for X, y, sample_metadata in data:
-    if sample_metadata.is_train:
+for dataset_meta, skip_dataset, learner in learners.values():
+    if skip_dataset or dataset_meta.dataset_name != "mix_private_telephony":
+        print(f"\nSkipping dataset '{dataset_meta.dataset_name}'.")
         continue
 
     print(
-        f"Sample: {sample_metadata.samples_slug} "
-        f"({sample_metadata.samples_index + 1}/"
-        f"{sample_metadata.samples_total}) "
-        f"{'TRAIN' if sample_metadata.is_train else 'VAL'} "
-        f"X.shape={X.shape} y.shape={y.shape}",
+        f"\nPredicting on dataset '{dataset_meta.dataset_name}' "
+        f"{dataset_meta.dataset_type}:"
     )
 
-    predicted.append(predictor.predict(audio_data=sample_metadata.audio_data))
+    for X, y, sample_metadata in learner:
+        if sample_metadata.is_train:
+            print(end="")
+            print(
+                f"{dataset_meta.dataset_name}: "
+                f"Skipped sample {sample_metadata.samples_index + 1}/"
+                f"{sample_metadata.samples_total} ",
+                end="\r",
+            )
+            continue
+
+        # print(
+        #     f"Sample: {sample_metadata.samples_slug} "
+        #     f"({sample_metadata.samples_index + 1}/"
+        #     f"{sample_metadata.samples_total}) "
+        #     f"{'TRAIN' if sample_metadata.is_train else 'VAL'} "
+        #     f"X.shape={X.shape} y.shape={y.shape}",
+        # )
+
+        predicted.append(predictor.predict(audio_data=sample_metadata.audio_data))
+
+        print(end="")
+        print(
+            f"{dataset_meta.dataset_name}: "
+            f"Sample {sample_metadata.samples_index + 1}/"
+            f"{sample_metadata.samples_total} ",
+            end="\r",
+        )
+    print("")
 
 
 print(f"Total prediction time: {time() - s0:.3f}s.")
+
+# %%
+predicted1 = []
+print(len(predicted))
+for audio_data in predicted:
+    if not audio_data.file_path.startswith("mix_private_telephony"):
+        print(f"\nSkipping file '{audio_data.file_path}'.")
+        continue
+
+    predicted1.append(predictor.predict(audio_data=audio_data))
 
 
 # %%
@@ -2120,10 +2411,11 @@ class StaticPlotAudioVisualizer(AbstractAudioVisualizer):
 
         # Predicted probabilities.
         if audio_data.predicted_probas is not None:
+            ax3 = ax1.twinx()
             t_pred_proba = (
                 np.arange(len(audio_data.predicted_probas)) * audio_data.chunk_size
             ) / sr
-            ax2.step(
+            ax3.step(
                 t_pred_proba,
                 audio_data.predicted_probas,
                 color="red",
@@ -2190,7 +2482,7 @@ class InteractivePlotAudioVisualizer(AbstractAudioVisualizer):
                     mode="lines",
                     name="Predicted Speech Probability",
                     line=dict(shape="hv", color="red", width=1.2),
-                    yaxis="y2",
+                    yaxis="y3",
                 )
             )
 
@@ -2200,6 +2492,12 @@ class InteractivePlotAudioVisualizer(AbstractAudioVisualizer):
             yaxis=dict(title="Amplitude"),
             yaxis2=dict(
                 title="Speech Probability from Teacher", overlaying="y", side="right"
+            ),
+            yaxis3=dict(
+                title="Predicted Speech Probability",
+                overlaying="y",
+                side="right",
+                position=0.95,
             ),
             legend=dict(x=0.01, y=500, bordercolor="Black", borderwidth=1),
         )
@@ -2222,22 +2520,52 @@ class InteractiveFeatureVisualizer(AbstractAudioVisualizer):
     def show(self) -> None:
         import numpy as np
         import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
 
-        assert self._audio_data.sr is not None
-        assert self._audio_data.audio is not None
-        assert self._audio_data.feat_vectors is not None
-
-        feat_vectors = self._audio_data.feat_vectors
         audio = self._audio_data.audio
+        assert audio is not None
         sr = self._audio_data.sr
-        frames = feat_vectors.shape[0]
-        frame_duration = self._audio_data.chunk_size / sr
+        assert sr is not None
+        feat = self._audio_data.feat_vectors
+        assert feat is not None
+        chunk_size = self._audio_data.chunk_size
+
+        frames, feat_dim = feat.shape
+        frame_duration = chunk_size / sr
 
         t_audio = np.arange(len(audio)) / sr
         t_frames = np.arange(frames) * frame_duration
 
-        fig = go.Figure()
+        # --- feature indexing ---
+        scalar_names = [
+            "Log Energy",
+            "ZCR",
+            "Centroid",
+            "Flatness",
+            "Tonality",
+            "Rolloff",
+            "LF/HF Ratio",
+            "Peaks",
+            "Flux",
+        ]
+        n_scalar = len(scalar_names)
+        mel = feat[:, n_scalar:]
 
+        # --- figure with subplots ---
+        fig = make_subplots(
+            rows=4,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            subplot_titles=(
+                "Waveform",
+                "Energy / Temporal",
+                "Spectral Shape",
+                "Dynamics",
+            ),
+        )
+
+        # --- waveform ---
         fig.add_trace(
             go.Scatter(
                 x=t_audio,
@@ -2245,65 +2573,83 @@ class InteractiveFeatureVisualizer(AbstractAudioVisualizer):
                 mode="lines",
                 name="Waveform",
                 line=dict(color="black", width=1),
-            )
+            ),
+            row=1,
+            col=1,
         )
 
-        labels = ["Centroid", "Bandwidth"]
-        colors = ["green", "orange"]
-        for i, (label, color) in enumerate(zip(labels, colors)):
+        # --- energy + ZCR ---
+        for idx, name, color in [
+            (0, "Log Energy", "red"),
+            (1, "ZCR", "blue"),
+        ]:
             fig.add_trace(
                 go.Scatter(
                     x=t_frames,
-                    y=feat_vectors[:, i],
+                    y=feat[:, idx],
                     mode="lines",
-                    name=label,
-                    line=dict(color=color, width=2),
-                    yaxis="y2",
+                    name=name,
                     opacity=0.6,
-                )
+                    line=dict(width=2),
+                ),
+                row=2,
+                col=1,
             )
 
-        labels = ["Log Energy", "ZCR", "Flux"]
-        colors = ["red", "blue", "purple"]
-        for i, (label, color) in enumerate(zip(labels, colors)):
+        # --- spectral shape ---
+        for idx, name in [
+            (2, "Centroid"),
+            (3, "Flatness"),
+            (4, "Tonality"),
+            (5, "Rolloff"),
+            (6, "LF/HF Ratio"),
+            (7, "Peaks"),
+        ]:
             fig.add_trace(
                 go.Scatter(
                     x=t_frames,
-                    y=feat_vectors[:, i],
+                    y=feat[:, idx],
                     mode="lines",
-                    name=label,
-                    line=dict(color=color, width=2),
-                    yaxis="y3",
+                    name=name,
                     opacity=0.6,
-                )
+                ),
+                row=3,
+                col=1,
             )
+
+        # --- dynamics ---
+        fig.add_trace(
+            go.Scatter(
+                x=t_frames,
+                y=feat[:, 8],
+                mode="lines",
+                name="Flux",
+                opacity=0.6,
+                line=dict(color="purple"),
+            ),
+            row=4,
+            col=1,
+        )
 
         fig.update_layout(
-            height=600,
-            xaxis=dict(title="Time (s)"),
-            yaxis=dict(title="Amplitude (Waveform)"),
-            yaxis2=dict(
-                title="Features",
-                overlaying="y",
-                side="right",
-                showgrid=False,
+            height=900,
+            xaxis_title="Time (s)",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0.01,
             ),
-            yaxis3=dict(
-                title="Features",
-                overlaying="y",
-                side="right",
-                position=0.95,
-                showgrid=False,
-            ),
-            legend=dict(x=0.01, y=0.99, bordercolor="Black", borderwidth=1),
-            title="Audio Waveform with Features",
+            title="Audio + Scalar Features",
         )
 
         fig.show()
 
-        fig_mfcc = go.Figure()
+        # ===== log-mel heatmap =====
+        fig_mel = go.Figure()
 
-        fig_mfcc.add_trace(
+        fig_mel.add_trace(
             go.Scatter(
                 x=t_audio,
                 y=audio,
@@ -2313,33 +2659,205 @@ class InteractiveFeatureVisualizer(AbstractAudioVisualizer):
             )
         )
 
-        fig_mfcc.add_trace(
+        fig_mel.add_trace(
             go.Heatmap(
-                z=feat_vectors[:, 5 : 5 + 8].T,
+                z=mel.T,
                 x=t_frames,
-                y=np.arange(1, 9),
-                yaxis="y2",
+                y=np.arange(mel.shape[1]),
                 colorscale="Viridis",
-                colorbar=dict(title="MFCC Coef"),
+                colorbar=dict(title="Log-Mel Energy"),
                 opacity=0.9,
+                yaxis="y2",
             )
         )
 
-        fig_mfcc.update_layout(
+        fig_mel.update_layout(
             height=600,
             xaxis=dict(title="Time (s)"),
-            yaxis=dict(title="Amplitude (Waveform)"),
+            yaxis=dict(title="Amplitude"),
             yaxis2=dict(
-                title="MFCC Index",
+                title="Mel Band",
                 overlaying="y",
                 side="right",
                 showgrid=False,
             ),
-            legend=dict(x=0.01, y=0.99, bordercolor="Black", borderwidth=1),
-            title="Audio Waveform with MFCCs",
+            title="Waveform + Log-Mel Spectrogram",
         )
 
-        fig_mfcc.show()
+        fig_mel.show()
+
+
+class InteractiveScaledFeatureVisualizer(AbstractAudioVisualizer):
+    def __init__(
+        self, *, audio_data: AudioData, scaled_feat_vectors: np.ndarray
+    ) -> None:
+        fmt_err = "Audio data must contain {} for visualization."
+        if audio_data.audio is None:
+            raise ValueError(fmt_err.format("audio samples"))
+        elif audio_data.sr is None:
+            raise ValueError(fmt_err.format("sampling rate"))
+        self._audio_data = audio_data
+        self._scaled_feat_vectors = scaled_feat_vectors
+
+    def show(self) -> None:
+        import numpy as np
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        audio = self._audio_data.audio
+        assert audio is not None
+        sr = self._audio_data.sr
+        assert sr is not None
+        feat = self._scaled_feat_vectors
+        frames, feat_dim = feat.shape
+        frame_duration = self._audio_data.chunk_size / sr
+
+        t_audio = np.arange(len(audio)) / sr
+        t_frames = np.arange(frames) * frame_duration
+
+        # --- feature indexing ---
+        scalar_names = [
+            "Log Energy",
+            "ZCR",
+            "Centroid",
+            "Flatness",
+            "Tonality",
+            "Rolloff",
+            "LF/HF Ratio",
+            "Peaks",
+            "Flux",
+        ]
+        n_scalar = len(scalar_names)
+        mel = feat[:, n_scalar:]  # everything beyond scalars
+
+        # --- figure with subplots ---
+        fig = make_subplots(
+            rows=4,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            subplot_titles=(
+                "Waveform",
+                "Energy / Temporal",
+                "Spectral Shape",
+                "Dynamics",
+            ),
+        )
+
+        # --- waveform ---
+        fig.add_trace(
+            go.Scatter(
+                x=t_audio,
+                y=audio,
+                mode="lines",
+                name="Waveform",
+                line=dict(color="black", width=1),
+            ),
+            row=1,
+            col=1,
+        )
+
+        # --- energy + ZCR ---
+        for idx, name, color in [(0, "Log Energy", "red"), (1, "ZCR", "blue")]:
+            fig.add_trace(
+                go.Scatter(
+                    x=t_frames,
+                    y=feat[:, idx],
+                    mode="lines",
+                    name=name,
+                    opacity=0.7,
+                    line=dict(color=color, width=2),
+                ),
+                row=2,
+                col=1,
+            )
+
+        # --- spectral shape ---
+        for idx, name, color in zip(
+            range(2, 8),
+            scalar_names[2:],
+            ["green", "orange", "purple", "brown", "pink", "gray"],
+        ):
+            fig.add_trace(
+                go.Scatter(
+                    x=t_frames,
+                    y=feat[:, idx],
+                    mode="lines",
+                    name=name,
+                    opacity=0.7,
+                    line=dict(color=color, width=2),
+                ),
+                row=3,
+                col=1,
+            )
+
+        # --- dynamics ---
+        fig.add_trace(
+            go.Scatter(
+                x=t_frames,
+                y=feat[:, 8],
+                mode="lines",
+                name="Flux",
+                opacity=0.7,
+                line=dict(color="magenta", width=2),
+            ),
+            row=4,
+            col=1,
+        )
+
+        fig.update_layout(
+            height=900,
+            xaxis_title="Time (s)",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0.01,
+            ),
+            title="Audio + Scaled Scalar Features",
+        )
+
+        fig.show()
+
+        # ===== scaled log-mel heatmap =====
+        fig_mel = go.Figure()
+        fig_mel.add_trace(
+            go.Scatter(
+                x=t_audio,
+                y=audio,
+                mode="lines",
+                name="Waveform",
+                line=dict(color="black", width=1),
+            )
+        )
+
+        fig_mel.add_trace(
+            go.Heatmap(
+                z=mel.T,
+                x=t_frames,
+                y=np.arange(mel.shape[1]),
+                colorscale="Viridis",
+                colorbar=dict(title="Scaled Mel Bands"),
+                opacity=0.9,
+                yaxis="y2",
+            )
+        )
+
+        fig_mel.update_layout(
+            height=600,
+            xaxis=dict(title="Time (s)"),
+            yaxis=dict(title="Amplitude"),
+            yaxis2=dict(
+                title="Mel Band Index",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+            ),
+            title="Waveform + Scaled Mel Spectrogram",
+        )
+
+        fig_mel.show()
 
 
 class PlayerWidgetAudioVisualizer(AbstractAudioVisualizer):
@@ -2366,13 +2884,69 @@ class AudioVisualizer(AbstractAudioVisualizer):
 
 
 # %%
-audio_data = predicted[-1]
+for i, audio_data in enumerate(predicted):
+    print(f"Sample {i}: {audio_data.file_path}")
+
+# %%
+audio_data = AudioData(
+    file_path="./audio_file_713.wav",
+    target_sr=8000,
+    chunk_size=int(0.01 * 8000),  # 10 ms chunks
+)
+
+audio_data = AudioLoader(print_stats=True).load(audio_data=audio_data)
+audio_data = SileroProbabilityTeacher(print_stats=True).teach(
+    audio_data=audio_data,
+)
+audio_data = AudioFeatureExtractor(print_stats=True).extract(
+    audio_data=audio_data, frame_generator=AudioFrameGenerator()
+)
+
 print(f"Visualizing sample: {audio_data.file_path}")
 
 visualizer = AudioVisualizer(
     StaticPlotAudioVisualizer(audio_data=audio_data),
     InteractivePlotAudioVisualizer(audio_data=audio_data),
     InteractiveFeatureVisualizer(audio_data=audio_data),
+    InteractiveScaledFeatureVisualizer(
+        audio_data=audio_data,
+        scaled_feat_vectors=Scaler(
+            n_features=audio_data.feat_vectors.shape[1]
+        ).fit_transform(audio_data.feat_vectors),
+    ),
+    PlayerWidgetAudioVisualizer(audio_data=audio_data),
+)
+
+visualizer.show()
+
+# %%
+
+audio_data = AudioData(
+    file_path="./audio_file_550.wav",
+    target_sr=8000,
+    chunk_size=int(0.01 * 8000),  # 10 ms chunks
+)
+
+audio_data = AudioLoader(print_stats=True).load(audio_data=audio_data)
+audio_data = SileroProbabilityTeacher(print_stats=True).teach(
+    audio_data=audio_data,
+)
+audio_data = AudioFeatureExtractor(print_stats=True).extract(
+    audio_data=audio_data, frame_generator=AudioFrameGenerator()
+)
+
+print(f"Visualizing sample: {audio_data.file_path}")
+
+visualizer = AudioVisualizer(
+    StaticPlotAudioVisualizer(audio_data=audio_data),
+    InteractivePlotAudioVisualizer(audio_data=audio_data),
+    InteractiveFeatureVisualizer(audio_data=audio_data),
+    InteractiveScaledFeatureVisualizer(
+        audio_data=audio_data,
+        scaled_feat_vectors=Scaler(
+            n_features=audio_data.feat_vectors.shape[1]
+        ).fit_transform(audio_data.feat_vectors),
+    ),
     PlayerWidgetAudioVisualizer(audio_data=audio_data),
 )
 
