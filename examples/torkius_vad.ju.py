@@ -49,7 +49,7 @@ from abc import ABC, abstractmethod  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from enum import StrEnum  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import Any, Callable, Generator, Literal, NamedTuple, cast  # noqa: E402
+from typing import Any, Callable, Generator, Literal, NamedTuple, Protocol, cast  # noqa: E402
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -1427,26 +1427,26 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
         freqs = np.linspace(0, sr / 2, num=len(fft_spectrum))
 
         centroid = np.sum(freqs * fft_spectrum)
-        flatness = np.exp(np.mean(np.log(fft_spectrum))) / (
-            np.mean(fft_spectrum) + self._eps
-        )
+        # flatness = np.exp(np.mean(np.log(fft_spectrum))) / (
+        #    np.mean(fft_spectrum) + self._eps
+        # )
         tonality = np.log(np.max(fft_spectrum) / (np.mean(fft_spectrum) + self._eps))
-        rolloff_idx = np.searchsorted(np.cumsum(fft_spectrum), 0.85)
-        rolloff_idx = min(rolloff_idx, len(freqs) - 1)
-        rolloff = freqs[rolloff_idx]
-        lf_energy = np.sum(fft_spectrum[freqs <= 300.0])
-        hf_energy = np.sum(fft_spectrum[freqs >= 300.0])
-        lf_ratio = lf_energy / (hf_energy + self._eps)
+        # rolloff_idx = np.searchsorted(np.cumsum(fft_spectrum), 0.85)
+        # rolloff_idx = min(rolloff_idx, len(freqs) - 1)
+        # rolloff = freqs[rolloff_idx]
+        # lf_energy = np.sum(fft_spectrum[freqs <= 300.0])
+        # hf_energy = np.sum(fft_spectrum[freqs >= 300.0])
+        # lf_ratio = lf_energy / (hf_energy + self._eps)
         peaks = np.sum(fft_spectrum > 0.1 * np.max(fft_spectrum))
 
-        if prev_fft_spectrum is None:
-            flux = 0.0
-        else:
-            diff = fft_spectrum - prev_fft_spectrum
-            flux = (
-                np.sum(diff * diff) / (np.sum(prev_fft_spectrum**2) + self._eps)
-                + self._eps
-            )
+        # if prev_fft_spectrum is None:
+        #     flux = 0.0
+        # else:
+        #     diff = fft_spectrum - prev_fft_spectrum
+        #     flux = (
+        #         np.sum(diff * diff) / (np.sum(prev_fft_spectrum**2) + self._eps)
+        #         + self._eps
+        #     )
 
         mel_energy = self._mel_filter_bank @ fft_spectrum
         log_mel_energy = np.log(mel_energy + self._eps)
@@ -1456,12 +1456,12 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
                 log_energy,
                 zcr,
                 centroid,
-                flatness,
+                # flatness,
                 tonality,
-                rolloff,
-                lf_ratio,
+                # rolloff,
+                # lf_ratio,
                 peaks,
-                flux,
+                # flux,
                 log_mel_energy,
             ]
         ).astype(np.float32)
@@ -1470,27 +1470,41 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
 
 
 # %%
-class Scaler:
-    def __init__(self, n_features: int):
-        self.n_features = n_features
-        self.count = 0
-        self.mean = np.zeros(n_features, dtype=np.float64)
-        self.M2 = np.zeros(
-            n_features, dtype=np.float64
-        )  # Sum of squares of differences
+class ScalerProtocol(Protocol):
+    def partial_fit(self, X: np.ndarray) -> None: ...
+
+    def transform(self, X: np.ndarray) -> np.ndarray: ...
+
+    def fit_transform(self, X: np.ndarray) -> np.ndarray: ...
+
+
+class StdScaler(ScalerProtocol):
+    def __init__(self):
+        self._count = 0
+        self._mean = None
+        self._m2 = None
+
+    def _ensure_init(self, X: np.ndarray) -> None:
+        if self._mean is None or self._m2 is None:
+            n_features = X.shape[1]
+            self._mean = np.zeros(n_features, dtype=np.float64)
+            # Sum of squares of differences.
+            self._m2 = np.zeros(n_features, dtype=np.float64)
 
     def partial_fit(self, X: np.ndarray) -> None:
+        self._ensure_init(X)
         for x in X:
-            self.count += 1
-            delta = x - self.mean
-            self.mean += delta / self.count
-            delta2 = x - self.mean
-            self.M2 += delta * delta2
+            self._count += 1
+            delta = x - self._mean
+            self._mean += delta / self._count
+            delta2 = x - self._mean
+            self._m2 += delta * delta2
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        std = np.sqrt(self.M2 / np.maximum(self.count - 1, 1))
-        std[std < 1e-8] = 1.0  # avoid division by zero
-        return (X - self.mean) / std
+        self._ensure_init(X)
+        std = np.sqrt(self._m2 / np.maximum(self._count - 1, 1))
+        std[std < 1e-8] = 1.0  # Avoid division by zero.
+        return (X - self._mean) / std
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
         self.partial_fit(X)
@@ -1507,7 +1521,7 @@ class AbstractFeatureWithContextStats(ABC):
 
 
 class FeatureWithContextStats(AbstractFeatureWithContextStats):
-    def __init__(self, *, context_size: int = 5) -> None:
+    def __init__(self, *, context_size: int = 10) -> None:
         from collections import deque
 
         self._context_size = context_size
@@ -1521,16 +1535,18 @@ class FeatureWithContextStats(AbstractFeatureWithContextStats):
 
         mean_vec = np.mean(buf_array, axis=0)
         std_vec = np.std(buf_array, axis=0)
-        min_vec = np.min(buf_array, axis=0)
-        max_vec = np.max(buf_array, axis=0)
+        var_vec = np.var(buf_array, axis=0)
+        # min_vec = np.min(buf_array, axis=0)
+        # max_vec = np.max(buf_array, axis=0)
 
         feat_with_stats = np.hstack(
             [
-                feat_vec,
+                # feat_vec,
                 mean_vec,
                 std_vec,
-                min_vec,
-                max_vec,
+                var_vec,
+                # min_vec,
+                # max_vec,
             ]
         ).astype(np.float32)
         return feat_with_stats
@@ -1892,6 +1908,9 @@ class AbstractPredictionModel(ABC):
     @abstractmethod
     def decision_function(self, *, X: np.ndarray) -> np.ndarray: ...
 
+    @abstractmethod
+    def predict_proba(self, *, X: np.ndarray) -> np.ndarray: ...
+
 
 class SGDClassifierModel(AbstractPredictionModel):
     def __init__(self, *, model: SGDClassifier) -> None:
@@ -1899,6 +1918,9 @@ class SGDClassifierModel(AbstractPredictionModel):
 
     def decision_function(self, *, X: np.ndarray) -> np.ndarray:
         return self._model.decision_function(X)
+
+    def predict_proba(self, *, X: np.ndarray) -> np.ndarray:
+        return self._model.predict_proba(X)
 
 
 class SGDEnsembleModel(AbstractPredictionModel):
@@ -1908,12 +1930,20 @@ class SGDEnsembleModel(AbstractPredictionModel):
     def decision_function(self, *, X: np.ndarray) -> np.ndarray:
         import numpy as np
 
-        all_preds = np.array(
+        logits = np.stack(
             [model.decision_function(X) for model in self._models],
-            dtype=np.float32,
+            axis=0,
         )
-        avg_preds = np.mean(all_preds, axis=0)
-        return avg_preds
+
+        avg_logits = np.mean(logits, axis=0)
+        return avg_logits
+
+    def predict_proba(self, *, X: np.ndarray) -> np.ndarray:
+        from scipy.special import expit
+
+        logits = self.decision_function(X=X)
+        probas = expit(logits)
+        return probas
 
 
 class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
@@ -1921,7 +1951,7 @@ class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
         self,
         *,
         model: AbstractPredictionModel,
-        scaler: StandardScaler,
+        scaler: ScalerProtocol,
         X_ctx: AbstractFeatureWithContextStats,
         print_stats: bool = True,
     ) -> None:
@@ -1935,6 +1965,9 @@ class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
 
     def decision_function(self, *, X: np.ndarray) -> np.ndarray:
         return self._model.decision_function(X=X)
+
+    def predict_proba(self, *, X: np.ndarray) -> np.ndarray:
+        return self._model.predict_proba(X=X)
 
     def predict(self, *, audio_data: AudioData) -> AudioData:
         fmt_err = "Audio data must contain {} for prediction."
@@ -1953,7 +1986,7 @@ class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
 
         s0 = time()
         X = self._scaler.transform(X)
-        y_pred = self.decision_function(X=X)
+        y_pred = self.predict_proba(X=X)
         s1 = time()
 
         if self._print_stats:
@@ -2060,13 +2093,11 @@ pipeline_manager.run()
 from sklearn.linear_model import SGDClassifier  # noqa: E402
 from sklearn.preprocessing import StandardScaler  # noqa: E402
 
-scaler = StandardScaler()
-
 models = [
     SGDClassifier(
         loss="log_loss",
         learning_rate="optimal",
-        alpha=1e-5,
+        alpha=1e-5 + random.random() * 1e-4,
         penalty="l2",
         warm_start=True,
     )
@@ -2083,179 +2114,222 @@ learning_pipeline = DatasetPartialLearningPipeline(print_stats=False)
 SKIP = True
 NOT_SKIP = False
 
-learners = {
-    "mix_ava": (
-        dataset_metas["mix_ava"],
-        NOT_SKIP,
-        learning_pipeline.process(
-            dataset_meta=dataset_metas["mix_ava"].shuffled(
-                random_state=42,
+
+def make_learners() -> dict[str, tuple[DatasetMeta, bool, Generator]]:
+    return {
+        "mix_ava": (
+            dataset_metas["mix_ava"],
+            NOT_SKIP,
+            learning_pipeline.process(
+                dataset_meta=dataset_metas["mix_ava"].shuffled(
+                    random_state=42,
+                ),
+                dataset_loader=dataset_loader,
+                dataset_teacher=make_mix_dataset_teacher(),
+                dataset_feature_extractor=dataset_feature_extractor,
+                X_ctx=X_ctx,
+                train_split=0.9,
+                skip_first=0.0,
             ),
-            dataset_loader=dataset_loader,
-            dataset_teacher=make_mix_dataset_teacher(),
-            dataset_feature_extractor=dataset_feature_extractor,
-            X_ctx=X_ctx,
-            train_split=0.9,
-            skip_first=0.0,
         ),
-    ),
-    "mix_private_telephony": (
-        dataset_metas["mix_private_telephony"],
-        NOT_SKIP,
-        learning_pipeline.process(
-            dataset_meta=dataset_metas["mix_private_telephony"].shuffled(
-                random_state=42,
+        "mix_private_telephony": (
+            dataset_metas["mix_private_telephony"],
+            NOT_SKIP,
+            learning_pipeline.process(
+                dataset_meta=dataset_metas["mix_private_telephony"].shuffled(
+                    random_state=42,
+                ),
+                dataset_loader=dataset_loader,
+                dataset_teacher=make_mix_dataset_teacher(),
+                dataset_feature_extractor=dataset_feature_extractor,
+                X_ctx=X_ctx,
+                train_split=0.9,
+                skip_first=0.0,
             ),
-            dataset_loader=dataset_loader,
-            dataset_teacher=make_mix_dataset_teacher(),
-            dataset_feature_extractor=dataset_feature_extractor,
-            X_ctx=X_ctx,
-            train_split=0.9,
-            skip_first=0.0,
         ),
-    ),
-    "mix_voxconverse_test": (
-        dataset_metas["mix_voxconverse_test"],
-        NOT_SKIP,
-        learning_pipeline.process(
-            dataset_meta=dataset_metas["mix_voxconverse_test"].shuffled(
-                random_state=42,
+        "mix_voxconverse_test": (
+            dataset_metas["mix_voxconverse_test"],
+            NOT_SKIP,
+            learning_pipeline.process(
+                dataset_meta=dataset_metas["mix_voxconverse_test"].shuffled(
+                    random_state=42,
+                ),
+                dataset_loader=dataset_loader,
+                dataset_teacher=make_mix_dataset_teacher(),
+                dataset_feature_extractor=dataset_feature_extractor,
+                X_ctx=X_ctx,
+                train_split=0.9,
+                skip_first=0.0,
             ),
-            dataset_loader=dataset_loader,
-            dataset_teacher=make_mix_dataset_teacher(),
-            dataset_feature_extractor=dataset_feature_extractor,
-            X_ctx=X_ctx,
-            train_split=0.9,
-            skip_first=0.0,
         ),
-    ),
-    "nonspeech_esc_50": (
-        dataset_metas["nonspeech_esc_50"],
-        NOT_SKIP,
-        learning_pipeline.process(
-            dataset_meta=dataset_metas["nonspeech_esc_50"].shuffled(
-                random_state=42,
+        "nonspeech_esc_50": (
+            dataset_metas["nonspeech_esc_50"],
+            NOT_SKIP,
+            learning_pipeline.process(
+                dataset_meta=dataset_metas["nonspeech_esc_50"].shuffled(
+                    random_state=42,
+                ),
+                dataset_loader=dataset_loader,
+                dataset_teacher=make_nonspeech_dataset_teacher(),
+                dataset_feature_extractor=dataset_feature_extractor,
+                X_ctx=X_ctx,
+                train_split=0.9,
+                skip_first=0.0,
             ),
-            dataset_loader=dataset_loader,
-            dataset_teacher=make_nonspeech_dataset_teacher(),
-            dataset_feature_extractor=dataset_feature_extractor,
-            X_ctx=X_ctx,
-            train_split=0.9,
-            skip_first=0.0,
         ),
-    ),
-    "nonspeech_musan_music_rmf": (
-        dataset_metas["nonspeech_musan_music_rmf"],
-        NOT_SKIP,
-        learning_pipeline.process(
-            dataset_meta=dataset_metas["nonspeech_musan_music_rmf"].shuffled(
-                random_state=42,
+        "nonspeech_musan_music_rmf": (
+            dataset_metas["nonspeech_musan_music_rmf"],
+            NOT_SKIP,
+            learning_pipeline.process(
+                dataset_meta=dataset_metas["nonspeech_musan_music_rmf"].shuffled(
+                    random_state=42,
+                ),
+                dataset_loader=dataset_loader,
+                dataset_teacher=make_nonspeech_dataset_teacher(),
+                dataset_feature_extractor=dataset_feature_extractor,
+                X_ctx=X_ctx,
+                train_split=0.9,
+                skip_first=0.0,
             ),
-            dataset_loader=dataset_loader,
-            dataset_teacher=make_nonspeech_dataset_teacher(),
-            dataset_feature_extractor=dataset_feature_extractor,
-            X_ctx=X_ctx,
-            train_split=0.9,
-            skip_first=0.0,
         ),
-    ),
-    "nonspeech_musan_noise": (
-        dataset_metas["nonspeech_musan_noise"],
-        NOT_SKIP,
-        learning_pipeline.process(
-            dataset_meta=dataset_metas["nonspeech_musan_noise"].shuffled(
-                random_state=42,
+        "nonspeech_musan_noise": (
+            dataset_metas["nonspeech_musan_noise"],
+            NOT_SKIP,
+            learning_pipeline.process(
+                dataset_meta=dataset_metas["nonspeech_musan_noise"].shuffled(
+                    random_state=42,
+                ),
+                dataset_loader=dataset_loader,
+                dataset_teacher=make_nonspeech_dataset_teacher(),
+                dataset_feature_extractor=dataset_feature_extractor,
+                X_ctx=X_ctx,
+                train_split=0.9,
+                skip_first=0.0,
             ),
-            dataset_loader=dataset_loader,
-            dataset_teacher=make_nonspeech_dataset_teacher(),
-            dataset_feature_extractor=dataset_feature_extractor,
-            X_ctx=X_ctx,
-            train_split=0.9,
-            skip_first=0.0,
         ),
-    ),
-    "speech_callhome_deu": (
-        dataset_metas["speech_callhome_deu"],
-        NOT_SKIP,
-        learning_pipeline.process(
-            dataset_meta=dataset_metas["speech_callhome_deu"].shuffled(
-                random_state=42,
+        "speech_callhome_deu": (
+            dataset_metas["speech_callhome_deu"],
+            NOT_SKIP,
+            learning_pipeline.process(
+                dataset_meta=dataset_metas["speech_callhome_deu"].shuffled(
+                    random_state=42,
+                ),
+                dataset_loader=dataset_loader,
+                dataset_teacher=make_mix_dataset_teacher(),
+                dataset_feature_extractor=dataset_feature_extractor,
+                X_ctx=X_ctx,
+                train_split=0.9,
+                skip_first=0.0,
             ),
-            dataset_loader=dataset_loader,
-            dataset_teacher=make_mix_dataset_teacher(),
-            dataset_feature_extractor=dataset_feature_extractor,
-            X_ctx=X_ctx,
-            train_split=0.9,
-            skip_first=0.0,
         ),
-    ),
-    "speech_musan_speech": (
-        dataset_metas["speech_musan_speech"],
-        NOT_SKIP,
-        learning_pipeline.process(
-            dataset_meta=dataset_metas["speech_musan_speech"].shuffled(
-                random_state=42,
+        "speech_musan_speech": (
+            dataset_metas["speech_musan_speech"],
+            NOT_SKIP,
+            learning_pipeline.process(
+                dataset_meta=dataset_metas["speech_musan_speech"].shuffled(
+                    random_state=42,
+                ),
+                dataset_loader=dataset_loader,
+                dataset_teacher=make_mix_dataset_teacher(),
+                dataset_feature_extractor=dataset_feature_extractor,
+                X_ctx=X_ctx,
+                train_split=0.9,
+                skip_first=0.0,
             ),
-            dataset_loader=dataset_loader,
-            dataset_teacher=make_mix_dataset_teacher(),
-            dataset_feature_extractor=dataset_feature_extractor,
-            X_ctx=X_ctx,
-            train_split=0.9,
-            skip_first=0.0,
         ),
-    ),
-}
+    }
+
 
 # %%
-# data = []
-# for X, y, sample_metadata in learners["mix_private_telephony"]():
-#     print(sample_metadata.is_train)
-#     data.append((X, y, sample_metadata))
-
+scaler = StdScaler()
 # %%
 
 s0 = time()
-for dataset_meta, skip_dataset, learner in learners.values():
-    if skip_dataset:
-        print(f"\nSkipping dataset '{dataset_meta.dataset_name}'.")
+for dataset_meta, skip, learner in make_learners().values():
+    if skip:
         continue
 
-    print(
-        f"\nLearning on dataset '{dataset_meta.dataset_name}' {dataset_meta.dataset_type}:"
-    )
-
-    for X, y, sample_metadata in learner:
-        # print(
-        #     f"Sample: {sample_metadata.samples_slug} "
-        #     f"({sample_metadata.samples_index + 1}/"
-        #     f"{sample_metadata.samples_total}) "
-        #     f"{'TRAIN' if sample_metadata.is_train else 'VAL'} "
-        #     f"X.shape={X.shape} y.shape={y.shape}",
-        # )
+    for X, _, meta in learner:
+        if not meta.is_train:
+            continue
 
         t0 = time()
-        if dataset_meta.dataset_type != DatasetType.NONSPEECH:
-            scaler.partial_fit(X)
-        X = scaler.transform(X)
+        scaler.partial_fit(X)
 
-        for clf in models:
-            clf.partial_fit(X, y, classes=[0.0, 1.0])
-
-        # print(f"Fitted in {time() - t0:.3f}s.")
-        print(end="")
+        print(f"Fitted in {time() - t0:.3f}s.")
         print(
             f"{dataset_meta.dataset_name}: "
-            f"Sample {sample_metadata.samples_index + 1}/"
-            f"{sample_metadata.samples_total} ",
-            end="\r",
+            f"Sample {meta.samples_index + 1}/"
+            f"{meta.samples_total} ",
         )
+print(f"Total scaler fitting time: {time() - s0:.3f}s.")
 
-        if not sample_metadata.is_next_train:
-            break
 
-    print("")
+# %%
+def round_robin_sampling(
+    learners_dict: dict[str, tuple[DatasetMeta, bool, Generator]],
+) -> Generator:
+    from collections import deque
 
+    learners_queue = deque(learners_dict.values())
+    while learners_queue:
+        dataset_meta, skip_dataset, learner = learners_queue.popleft()
+        if skip_dataset:
+            continue
+        try:
+            X, y, sample_metadata = next(learner)
+            yield dataset_meta, X, y, sample_metadata
+            learners_queue.append((dataset_meta, skip_dataset, learner))
+        except StopIteration:
+            continue
+
+
+s0 = time()
+to_predict = []
+for dataset_meta, X, y, meta in round_robin_sampling(make_learners()):
+    if not meta.is_train:
+        to_predict.append((dataset_meta, X, y, meta))
+        continue
+
+    t0 = time()
+    Xs = scaler.transform(X)
+    for clf in models:
+        clf.partial_fit(Xs, y, classes=[0.0, 1.0])
+
+    print(f"Fitted in {time() - t0:.3f}s.")
+    print(
+        f"{dataset_meta.dataset_name}: "
+        f"Sample {meta.samples_index + 1}/"
+        f"{meta.samples_total} ",
+    )
 print(f"Total learning time: {time() - s0:.3f}s.")
+
+# %%
+for clf in models:
+    clf.alpha *= 5.0  # Stabilize.
+
+# %%
+# Fine-tuning.
+s0 = time()
+learners = make_learners()
+_, _, mix_private_telephony_learner = learners["mix_private_telephony"]
+for X, y, sample_metadata in mix_private_telephony_learner:
+    if not sample_metadata.is_train:
+        continue
+
+    t0 = time()
+    Xs = scaler.transform(X)
+    for clf in models:
+        clf.partial_fit(Xs, y, classes=[0.0, 1.0])
+
+    print(f"Fine-tuned in {time() - t0:.3f}s.")
+    print(
+        f"{sample_metadata.samples_slug}: "
+        f"Sample {sample_metadata.samples_index + 1}/"
+        f"{sample_metadata.samples_total} ",
+    )
+print(f"Total fine-tuning time: {time() - s0:.3f}s.")
+
 
 # %%
 import pickle  # noqa: E402
@@ -2266,10 +2340,29 @@ with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
         {
             "scaler": scaler,
             "classifier": models,
-            "comment": "SGDClassifier trained on 'mix_private_telephony' dataset.",
+            "comment": (
+                "Ensemble of SGDClassifiers trained on all datasets. "
+                "Removed MFCCs, added tonality and peaks features. "
+                "Implemented custom scaler. Online learning on samples "
+                "from datasets in round-robin fashion. "
+                "Results: low probabilities for non-speech segments, ",
+                "including music, but confidence on speech segments could be higher.",
+            ),
         },
         f,
     )
+
+# %%
+with open("model_20260125_232737.pkl", "rb") as f:
+    saved_data = pickle.load(f)
+    saved_data["comment"] = (
+        "Ensemble of SGDClassifiers trained on all datasets. "
+        "MFCCs, scaler trained during main training, "
+        "online learning on datasets in sequential fashion. "
+        "Results: probabilities for non-speech segments could be lower, ",
+        "confidence on speech segments could be higher.",
+    )
+    print(saved_data["comment"])
 
 # %%
 pmeta = DatasetMeta(
@@ -2293,7 +2386,6 @@ DatasetAudioPipeline(print_stats=True).process(
 s0 = time()
 
 predictor = BaseOfflineSGDPredictor(
-    # model=SGDClassifierModel(model=models[0]),
     model=SGDEnsembleModel(models=models),
     scaler=scaler,
     X_ctx=X_ctx,
@@ -2301,58 +2393,17 @@ predictor = BaseOfflineSGDPredictor(
 )
 
 predicted = []
-for dataset_meta, skip_dataset, learner in learners.values():
-    if skip_dataset or dataset_meta.dataset_name != "mix_private_telephony":
-        print(f"\nSkipping dataset '{dataset_meta.dataset_name}'.")
-        continue
+for dataset_meta, X, y, meta in to_predict:
+    t0 = time()
+    predicted.append(predictor.predict(audio_data=meta.audio_data))
 
+    print(f"Predicted in {time() - t0:.3f}s.")
     print(
-        f"\nPredicting on dataset '{dataset_meta.dataset_name}' "
-        f"{dataset_meta.dataset_type}:"
+        f"{dataset_meta.dataset_name}: "
+        f"Sample {meta.samples_index + 1}/"
+        f"{meta.samples_total} ",
     )
-
-    for X, y, sample_metadata in learner:
-        if sample_metadata.is_train:
-            print(end="")
-            print(
-                f"{dataset_meta.dataset_name}: "
-                f"Skipped sample {sample_metadata.samples_index + 1}/"
-                f"{sample_metadata.samples_total} ",
-                end="\r",
-            )
-            continue
-
-        # print(
-        #     f"Sample: {sample_metadata.samples_slug} "
-        #     f"({sample_metadata.samples_index + 1}/"
-        #     f"{sample_metadata.samples_total}) "
-        #     f"{'TRAIN' if sample_metadata.is_train else 'VAL'} "
-        #     f"X.shape={X.shape} y.shape={y.shape}",
-        # )
-
-        predicted.append(predictor.predict(audio_data=sample_metadata.audio_data))
-
-        print(end="")
-        print(
-            f"{dataset_meta.dataset_name}: "
-            f"Sample {sample_metadata.samples_index + 1}/"
-            f"{sample_metadata.samples_total} ",
-            end="\r",
-        )
-    print("")
-
-
 print(f"Total prediction time: {time() - s0:.3f}s.")
-
-# %%
-predicted1 = []
-print(len(predicted))
-for audio_data in predicted:
-    if not audio_data.file_path.startswith("mix_private_telephony"):
-        print(f"\nSkipping file '{audio_data.file_path}'.")
-        continue
-
-    predicted1.append(predictor.predict(audio_data=audio_data))
 
 
 # %%
@@ -2778,6 +2829,19 @@ class InteractiveScaledFeatureVisualizer(AbstractAudioVisualizer):
             scalar_names[2:],
             ["green", "orange", "purple", "brown", "pink", "gray"],
         ):
+            skip = [
+                # "Log Energy",
+                # "ZCR",
+                # "Centroid",
+                # "Flatness",
+                # "Tonality",
+                # "Rolloff",
+                # "LF/HF Ratio",
+                # "Peaks",
+                # "Flux",
+            ]
+            if name in skip:
+                continue
             fig.add_trace(
                 go.Scatter(
                     x=t_frames,
@@ -2887,9 +2951,33 @@ class AudioVisualizer(AbstractAudioVisualizer):
 for i, audio_data in enumerate(predicted):
     print(f"Sample {i}: {audio_data.file_path}")
 
+
+# %%
+audio_data = predicted[111]
+
+X_ctx.reset()
+X = np.array(
+    [X_ctx.compute(feat_vec=feat_vec) for feat_vec in audio_data.feat_vectors],
+    dtype=np.float32,
+)
+X_ctx.reset()
+
+visualizer = AudioVisualizer(
+    StaticPlotAudioVisualizer(audio_data=audio_data),
+    InteractivePlotAudioVisualizer(audio_data=audio_data),
+    InteractiveFeatureVisualizer(audio_data=audio_data),
+    InteractiveScaledFeatureVisualizer(
+        audio_data=audio_data,
+        scaled_feat_vectors=scaler.transform(X),
+    ),
+    PlayerWidgetAudioVisualizer(audio_data=audio_data),
+)
+
+visualizer.show()
+
 # %%
 audio_data = AudioData(
-    file_path="./audio_file_713.wav",
+    file_path="./audio_file_550.wav",
     target_sr=8000,
     chunk_size=int(0.01 * 8000),  # 10 ms chunks
 )
@@ -2898,11 +2986,23 @@ audio_data = AudioLoader(print_stats=True).load(audio_data=audio_data)
 audio_data = SileroProbabilityTeacher(print_stats=True).teach(
     audio_data=audio_data,
 )
+
+
 audio_data = AudioFeatureExtractor(print_stats=True).extract(
     audio_data=audio_data, frame_generator=AudioFrameGenerator()
 )
 
+audio_data = predictor.predict(audio_data=audio_data)
+
+assert audio_data.feat_vectors is not None
 print(f"Visualizing sample: {audio_data.file_path}")
+
+X_ctx.reset()
+X = np.array(
+    [X_ctx.compute(feat_vec=feat_vec) for feat_vec in audio_data.feat_vectors],
+    dtype=np.float32,
+)
+X_ctx.reset()
 
 visualizer = AudioVisualizer(
     StaticPlotAudioVisualizer(audio_data=audio_data),
@@ -2910,9 +3010,7 @@ visualizer = AudioVisualizer(
     InteractiveFeatureVisualizer(audio_data=audio_data),
     InteractiveScaledFeatureVisualizer(
         audio_data=audio_data,
-        scaled_feat_vectors=Scaler(
-            n_features=audio_data.feat_vectors.shape[1]
-        ).fit_transform(audio_data.feat_vectors),
+        scaled_feat_vectors=scaler.transform(X),
     ),
     PlayerWidgetAudioVisualizer(audio_data=audio_data),
 )
@@ -2935,6 +3033,7 @@ audio_data = AudioFeatureExtractor(print_stats=True).extract(
     audio_data=audio_data, frame_generator=AudioFrameGenerator()
 )
 
+assert audio_data.feat_vectors is not None
 print(f"Visualizing sample: {audio_data.file_path}")
 
 visualizer = AudioVisualizer(
@@ -2943,9 +3042,7 @@ visualizer = AudioVisualizer(
     InteractiveFeatureVisualizer(audio_data=audio_data),
     InteractiveScaledFeatureVisualizer(
         audio_data=audio_data,
-        scaled_feat_vectors=Scaler(
-            n_features=audio_data.feat_vectors.shape[1]
-        ).fit_transform(audio_data.feat_vectors),
+        scaled_feat_vectors=StdScaler().fit_transform(audio_data.feat_vectors),
     ),
     PlayerWidgetAudioVisualizer(audio_data=audio_data),
 )
