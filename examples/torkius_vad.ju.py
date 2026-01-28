@@ -1418,10 +1418,17 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
 
         frame = frame * self._window
 
-        log_energy = np.log(np.sum(frame**2) + self._eps)
+        # log_energy = np.log(np.sum(frame**2) + self._eps)
         zcr = np.mean(frame[:-1] * frame[1:] < 0.0)
 
         fft_spectrum = np.abs(rfft(frame, n=self._n_fft)) + self._eps
+
+        if prev_fft_spectrum is None:
+            flux = 0.0
+        else:
+            diff = np.maximum(fft_spectrum - prev_fft_spectrum, 0.0)
+            flux = np.sum(diff)
+
         fft_spectrum /= np.sum(fft_spectrum)
 
         freqs = np.linspace(0, sr / 2, num=len(fft_spectrum))
@@ -1439,29 +1446,17 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
         # lf_ratio = lf_energy / (hf_energy + self._eps)
         peaks = np.sum(fft_spectrum > 0.1 * np.max(fft_spectrum))
 
-        # if prev_fft_spectrum is None:
-        #     flux = 0.0
-        # else:
-        #     diff = fft_spectrum - prev_fft_spectrum
-        #     flux = (
-        #         np.sum(diff * diff) / (np.sum(prev_fft_spectrum**2) + self._eps)
-        #         + self._eps
-        #     )
-
         mel_energy = self._mel_filter_bank @ fft_spectrum
         log_mel_energy = np.log(mel_energy + self._eps)
 
         feat_vec = np.hstack(
             [
-                log_energy,
+                # log_energy,
                 zcr,
                 centroid,
-                # flatness,
                 tonality,
-                # rolloff,
-                # lf_ratio,
                 peaks,
-                # flux,
+                flux,
                 log_mel_energy,
             ]
         ).astype(np.float32)
@@ -1521,7 +1516,7 @@ class AbstractFeatureWithContextStats(ABC):
 
 
 class FeatureWithContextStats(AbstractFeatureWithContextStats):
-    def __init__(self, *, context_size: int = 10) -> None:
+    def __init__(self, *, context_size: int = 20) -> None:
         from collections import deque
 
         self._context_size = context_size
@@ -1534,8 +1529,10 @@ class FeatureWithContextStats(AbstractFeatureWithContextStats):
         buf_array = np.vstack(self._buf)
 
         mean_vec = np.mean(buf_array, axis=0)
-        std_vec = np.std(buf_array, axis=0)
-        var_vec = np.var(buf_array, axis=0)
+        # std_vec = np.std(buf_array, axis=0)
+        var_vec = np.var(buf_array, axis=0, ddof=1)
+        delta_vec = buf_array[-1] - buf_array[0]
+        flux_var = np.var(buf_array[:, 4])
         # min_vec = np.min(buf_array, axis=0)
         # max_vec = np.max(buf_array, axis=0)
 
@@ -1543,8 +1540,10 @@ class FeatureWithContextStats(AbstractFeatureWithContextStats):
             [
                 # feat_vec,
                 mean_vec,
-                std_vec,
+                # std_vec,
                 var_vec,
+                delta_vec,
+                flux_var,
                 # min_vec,
                 # max_vec,
             ]
@@ -1987,6 +1986,7 @@ class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
         s0 = time()
         X = self._scaler.transform(X)
         y_pred = self.predict_proba(X=X)
+        # y_pred = self.decision_function(X=X)
         s1 = time()
 
         if self._print_stats:
@@ -2093,22 +2093,48 @@ pipeline_manager.run()
 from sklearn.linear_model import SGDClassifier  # noqa: E402
 from sklearn.preprocessing import StandardScaler  # noqa: E402
 
+
+alphas = [
+    1e-6,
+    3e-6,
+    1e-5,
+    3e-5,
+    1e-4,
+    3e-4,
+    1e-3,
+    3e-3,
+    1e-2,
+    3e-2,
+]
+class_weights = [
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.5, 1.0: 1.0},
+    {0.0: 2.0, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.5},
+    {0.0: 1.0, 1.0: 2.0},
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.5, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.5},
+]
 models = [
     SGDClassifier(
         loss="log_loss",
         learning_rate="optimal",
-        alpha=1e-5 + random.random() * 1e-4,
+        alpha=alpha,
         penalty="l2",
         warm_start=True,
     )
-    for _ in range(5)
+    for _, alpha in enumerate(alphas)
 ]
+for model, class_weight in zip(models, class_weights):
+    model.set_params(class_weight=class_weight)
 
 # %%
-
 from time import time  # noqa: E402
 
-X_ctx = FeatureWithContextStats(context_size=5)  # One instance is safe.
+X_ctx = FeatureWithContextStats(context_size=20)  # One instance is safe.
 learning_pipeline = DatasetPartialLearningPipeline(print_stats=False)
 
 SKIP = True
@@ -2242,8 +2268,8 @@ def make_learners() -> dict[str, tuple[DatasetMeta, bool, Generator]]:
 
 # %%
 scaler = StdScaler()
-# %%
 
+# %%
 s0 = time()
 for dataset_meta, skip, learner in make_learners().values():
     if skip:
@@ -2306,7 +2332,9 @@ print(f"Total learning time: {time() - s0:.3f}s.")
 
 # %%
 for clf in models:
-    clf.alpha *= 5.0  # Stabilize.
+    clf.alpha *= 0.1  # Stabilize.
+    clf.set_params(class_weight={0.0: 1.0, 1.0: 1.5})
+    # print(clf.get_params())
 
 # %%
 # Fine-tuning.
@@ -2330,6 +2358,48 @@ for X, y, sample_metadata in mix_private_telephony_learner:
     )
 print(f"Total fine-tuning time: {time() - s0:.3f}s.")
 
+# %%
+import pickle  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
+    pickle.dump(
+        {
+            "scaler": scaler,
+            "classifier": models,
+            "comment": (
+                "Ensemble of SGDClassifiers trained on all datasets. "
+                "Various but fixed hyperparameters: alphas and class weights. "
+                "Removed log energy, left mel energy. Added flux back, "
+                "added delta and flux varience to statistics. Increased context "
+                "from 100 to 200ms. Online learning on samples "
+                "from datasets in round-robin fashion. "
+            ),
+        },
+        f,
+    )
+
+# %%
+import pickle  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
+    pickle.dump(
+        {
+            "scaler": scaler,
+            "classifier": models,
+            "comment": (
+                "Ensemble of SGDClassifiers trained on all datasets. "
+                "Removed flatness, rolloff, flux. Added variance to context. "
+                "Increased context from 50 to 100ms. Online learning on samples "
+                "from datasets in round-robin fashion. "
+                "Results: very low probabilities for non-speech segments, "
+                "including tones and music, but confidence"
+                "on speech segments is low.",
+            ),
+        },
+        f,
+    )
 
 # %%
 import pickle  # noqa: E402
@@ -2359,10 +2429,26 @@ with open("model_20260125_232737.pkl", "rb") as f:
         "Ensemble of SGDClassifiers trained on all datasets. "
         "MFCCs, scaler trained during main training, "
         "online learning on datasets in sequential fashion. "
-        "Results: probabilities for non-speech segments could be lower, ",
-        "confidence on speech segments could be higher.",
+        "Results: probabilities for non-speech segments could be lower, "
+        "confidence on speech segments could be higher. "
+        "Symptoms: overfitting on music segments, instable scaling."
     )
+with open("model_20260125_232737.pkl", "wb") as f:
+    pickle.dump(saved_data, f)
     print(saved_data["comment"])
+
+# %%
+with open("to_predict.pkl", "wb") as f:
+    pickle.dump(to_predict, f)
+# %%
+import pickle
+
+# with open("to_predict.pkl", "rb") as f:
+#    to_predict = pickle.load(f)
+with open("model_20260127_224635.pkl", "rb") as f:
+    saved_data = pickle.load(f)
+    scaler = saved_data["scaler"]
+    models = saved_data["classifier"]
 
 # %%
 pmeta = DatasetMeta(
@@ -2391,6 +2477,7 @@ predictor = BaseOfflineSGDPredictor(
     X_ctx=X_ctx,
     print_stats=False,
 )
+# %%
 
 predicted = []
 for dataset_meta, X, y, meta in to_predict:
@@ -2549,6 +2636,7 @@ class InteractivePlotAudioVisualizer(AbstractAudioVisualizer):
                 overlaying="y",
                 side="right",
                 position=0.95,
+                range=[-1, 1],
             ),
             legend=dict(x=0.01, y=500, bordercolor="Black", borderwidth=1),
         )
@@ -2771,19 +2859,19 @@ class InteractiveScaledFeatureVisualizer(AbstractAudioVisualizer):
             "Log Energy",
             "ZCR",
             "Centroid",
-            "Flatness",
+            # "Flatness",
             "Tonality",
-            "Rolloff",
-            "LF/HF Ratio",
+            # "Rolloff",
+            # "LF/HF Ratio",
             "Peaks",
-            "Flux",
+            # "Flux",
+            "Log Mel Energy",
         ]
         n_scalar = len(scalar_names)
-        mel = feat[:, n_scalar:]  # everything beyond scalars
 
         # --- figure with subplots ---
         fig = make_subplots(
-            rows=4,
+            rows=3,
             cols=1,
             shared_xaxes=True,
             vertical_spacing=0.03,
@@ -2791,7 +2879,6 @@ class InteractiveScaledFeatureVisualizer(AbstractAudioVisualizer):
                 "Waveform",
                 "Energy / Temporal",
                 "Spectral Shape",
-                "Dynamics",
             ),
         )
 
@@ -2825,7 +2912,7 @@ class InteractiveScaledFeatureVisualizer(AbstractAudioVisualizer):
 
         # --- spectral shape ---
         for idx, name, color in zip(
-            range(2, 8),
+            range(2, n_scalar),
             scalar_names[2:],
             ["green", "orange", "purple", "brown", "pink", "gray"],
         ):
@@ -2833,12 +2920,9 @@ class InteractiveScaledFeatureVisualizer(AbstractAudioVisualizer):
                 # "Log Energy",
                 # "ZCR",
                 # "Centroid",
-                # "Flatness",
                 # "Tonality",
-                # "Rolloff",
-                # "LF/HF Ratio",
                 # "Peaks",
-                # "Flux",
+                # "Log Mel Energy",
             ]
             if name in skip:
                 continue
@@ -2855,20 +2939,6 @@ class InteractiveScaledFeatureVisualizer(AbstractAudioVisualizer):
                 col=1,
             )
 
-        # --- dynamics ---
-        fig.add_trace(
-            go.Scatter(
-                x=t_frames,
-                y=feat[:, 8],
-                mode="lines",
-                name="Flux",
-                opacity=0.7,
-                line=dict(color="magenta", width=2),
-            ),
-            row=4,
-            col=1,
-        )
-
         fig.update_layout(
             height=900,
             xaxis_title="Time (s)",
@@ -2883,45 +2953,6 @@ class InteractiveScaledFeatureVisualizer(AbstractAudioVisualizer):
         )
 
         fig.show()
-
-        # ===== scaled log-mel heatmap =====
-        fig_mel = go.Figure()
-        fig_mel.add_trace(
-            go.Scatter(
-                x=t_audio,
-                y=audio,
-                mode="lines",
-                name="Waveform",
-                line=dict(color="black", width=1),
-            )
-        )
-
-        fig_mel.add_trace(
-            go.Heatmap(
-                z=mel.T,
-                x=t_frames,
-                y=np.arange(mel.shape[1]),
-                colorscale="Viridis",
-                colorbar=dict(title="Scaled Mel Bands"),
-                opacity=0.9,
-                yaxis="y2",
-            )
-        )
-
-        fig_mel.update_layout(
-            height=600,
-            xaxis=dict(title="Time (s)"),
-            yaxis=dict(title="Amplitude"),
-            yaxis2=dict(
-                title="Mel Band Index",
-                overlaying="y",
-                side="right",
-                showgrid=False,
-            ),
-            title="Waveform + Scaled Mel Spectrogram",
-        )
-
-        fig_mel.show()
 
 
 class PlayerWidgetAudioVisualizer(AbstractAudioVisualizer):
@@ -2951,7 +2982,6 @@ class AudioVisualizer(AbstractAudioVisualizer):
 for i, audio_data in enumerate(predicted):
     print(f"Sample {i}: {audio_data.file_path}")
 
-
 # %%
 audio_data = predicted[111]
 
@@ -2965,7 +2995,7 @@ X_ctx.reset()
 visualizer = AudioVisualizer(
     StaticPlotAudioVisualizer(audio_data=audio_data),
     InteractivePlotAudioVisualizer(audio_data=audio_data),
-    InteractiveFeatureVisualizer(audio_data=audio_data),
+    # InteractiveFeatureVisualizer(audio_data=audio_data),
     InteractiveScaledFeatureVisualizer(
         audio_data=audio_data,
         scaled_feat_vectors=scaler.transform(X),
@@ -3007,7 +3037,7 @@ X_ctx.reset()
 visualizer = AudioVisualizer(
     StaticPlotAudioVisualizer(audio_data=audio_data),
     InteractivePlotAudioVisualizer(audio_data=audio_data),
-    InteractiveFeatureVisualizer(audio_data=audio_data),
+    # InteractiveFeatureVisualizer(audio_data=audio_data),
     InteractiveScaledFeatureVisualizer(
         audio_data=audio_data,
         scaled_feat_vectors=scaler.transform(X),
@@ -3018,7 +3048,6 @@ visualizer = AudioVisualizer(
 visualizer.show()
 
 # %%
-
 audio_data = AudioData(
     file_path="./audio_file_550.wav",
     target_sr=8000,

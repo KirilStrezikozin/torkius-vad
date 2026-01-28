@@ -1,6 +1,6 @@
 .direnv
 data/sets/
-data/processed/
+data/processed*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
