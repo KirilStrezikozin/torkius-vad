@@ -2,23 +2,163 @@
 """
 # Torkius VAD
 
-WIP.
+Streaming, weakly-supervised voice activity detection (VAD) model for telephony
+and audio processing applications. Robust enough to various acoustic conditions,
+noise types, tones, music, and recording devices.
 
-- [x] Interactive `PlayerWidget` for audio visualization.
-- [x] Loading and resampling audio files.
-- [x] Probability teacher (pseudo-labelling) with Silero VAD.
+![img](./0133_boosting.png)
+_(On the plot: blue is ideal, red is predicted)_
+
+This notebook includes full pipelines for:
+- Dataset metadata orchestration.
+- Dataset audio loading.
+- Pseudo-labelling (teaching).
+- Feature extraction and context aggregation.
+- Partial (online) and offline learning methods.
+- Evaluation and metrics.
+- Visualization of audio waveforms, VAD probabilities, and audio features.
+
+The pipeline is designed to be modular and extensible, allowing for easy
+experimentation with different datasets, teaching methods, features, and models.
+
+This notebook presents the core base for the Torkius VAD project. It has not
+reached its full potential yet, but it is a solid foundation for further development
+and experimentation. Check the [GitHub repository](https://github.com/KirilStrezikozin/torkius-vad)
+for the latest updates and code.
+"""
+
+# %% [markdown]
+"""
+## Background and motivation
+
+This project aims to build and train a model to classify audio segments into speech
+and non-speech categories, with freedom to additionally classify into speech/music+tones/rest
+using heuristics.
+
+## VAD pipeline strategy
+
+Audio data is chunked into fixed-size segments (e.g., 10ms). Various temporal and
+spectral features are then extracted from these segments. Features are accumulated
+over a context window (e.g., 1s) to capture temporal dependencies. A machine learning
+model is trained on these features to predict the probability of speech presence in each segment.
+
+## Weakly-supervised learning approach
+
+As there was no single VAD-ready dataset with labelled 10ms speech and non-speech segments available,
+a weakly-supervised learning approach was adopted. A probability teacher (pseudo-labelling)
+method was used to generate labels for the training data. The [Silero VAD](https://github.com/snakers4/silero-vad)
+model was used as the primary teacher to provide initial pseudo-labels for the audio segments in
+datasets containing speech and mix of speech and non-speech. For datasets containing only non-speech,
+a simple heuristic teacher was implemented to label all segments as non-speech.
+
+## Before training
+
+Before training the model, the following steps take place:
+
+1. **Dataset metadata orchestration**: The datasets are organized and their metadata is computed, including total hours, number of files, and size.
+2. **Audio loading**: Audio files are loaded and re-sampled to a common sample rate if necessary.
+3. **Probability teaching**: The Silero VAD model is used to generate pseudo-labels for the audio segments, which serve as the target probabilities for training.
+4. **Feature extraction and context aggregation**: Various features are extracted from the audio segments, and context is aggregated to capture temporal dependencies.
+
+Each stage optionally supports caching to disk to speed up subsequent runs and avoid redundant computations.
+
+After these steps, the final feature vectors and true labels for 120h of audio data
+from datasets occupy about 2GB of disk space. The datasets themselves occupy about 20GB of disk space.
+
+## Training
+
+The model was trained on a combination of speech, non-speech, and mix datasets.
+The total duration of audio used for training is roughly 120h.
+
+While the final set of features and model architecture were still being experimented with,
+an online training pipeline with `SGDClassifier` from `sklearn` was implemented and used.
+
+The reason for this is that the datasets are huge (20 GB) in size, which deems training
+on the entire dataset at once infeasible. The online training pipeline allows for training
+the model incrementally on batches of samples (per one audio file), which is more memory-efficient
+and allows for faster iterations during development.
+
+## Evaluation
+
+The following models were trained and evaluated:
+- `SGDClassifier` with different regularization settings and parameters and features.
+- Ensemble of `SGDClassifier` models.
+- `XGBClassifier` with different regularization settings and parameters.
+
+The model was evaluated on a separate test set containing a mix of speech and non-speech audio files.
+Evaluation metrics included accuracy, precision, recall, F1-score, confusion matrix, and ROC-AUC.
+
+## Results and future work
+
+The `SGDClassifier` model achieved an accuracy of 78% and recall of 75% on the test set.
+The `XGBClassifier` model achieved an accuracy of 89% and recall of 89% on the test set.
+ROC-AUC was 0.85 for the `SGDClassifier` and 0.96 for the `XGBClassifier`.
+
+These are excellent results for this first iteration of the project. However, there is
+still room for improvement and further experimentation with:
+
+- Features: revisiting the feature set.
+- Context window: finding the optimal smallest window size for the best performance.
+- Custom thresholding heuristics for speech/music+tones/rest.
+- Increasing the amount of training data and diversity of datasets for better generalization.
+- Re-training on self-predicted labels for further boosting performance.
+
+The trained model is quite robust to music and tones and detects speech in multiple languages
+in noisy conditions well. It is not perfect yet and there are situations where it
+fails and either predicts a low speech probability for speech segments or a high speech
+probability for non-speech segments.
+"""
+
+# %% [markdown]
+"""
+### Dataset selection
+
+Crossed-out datasets mainly complement the others and only make sense if future training with
+increased dataset size is planned.
+
+Non-speech:
+
+1. ~[UrbanSound8K](https://soundata.readthedocs.io/en/latest/source/quick_reference.html): A dataset containing 8,732 labeled sound excerpts (<=4s) of urban sounds from 10 classes, such as air conditioner, car horn, children playing, dog bark, drilling, engine idling, gunshot, jackhammer, siren, and street music.~
+2. [ESC-50](https://github.com/karolpiczak/ESC-50): A labeled collection of 2,000 environmental audio recordings (5s) organized into 50 classes, including animals, natural soundscapes, human non-speech sounds, interior/domestic sounds, and exterior/urban noises.
+3. ~[TAU NIGENS SSE 2021](https://soundata.readthedocs.io/en/latest/source/quick_reference.html): Spatial sound-scene recordings, consisting of sound events of distinct categories in a variety of acoustical spaces, and from multiple source directions and distances, at varying signal-to-noise ratios (SNR) ranging from noiseless (30dB) to noisy (6dB) conditions.~
+
+Speech (clean, noisy):
+
+1. ~[LibriSpeech Clean](https://www.openslr.org/12): 100 hours of clean read English speech derived from audiobooks from the LibriVox project, suitable for training and evaluating speech recognition systems.~
+2. [Callhome German](https://huggingface.co/datasets/talkbank/callhome): A dataset of telephone conversations in German.
+3. [VoxConverse test](https://github.com/joonson/voxconverse): A dataset for speaker diarization in real-world scenarios, containing multi-speaker conversations with overlapping speech and background noise.
+
+Speech and non-speech:
+
+1. [AVA-Speech for VAD](https://huggingface.co/datasets/nccratliri/vad-human-ava-speech): AVA-Speech dataset customized for Human Speech Voice Activity Detection in WhisperSeg. The audio files were extracted from films.
+2. [MUSAN](https://huggingface.co/datasets/FluidInference/musan): A corpus of music, speech, and noise recordings suitable for training and evaluating voice activity detection (VAD) systems.
+3. Private telephony: A collection of telephony audio recordings containing both speech and non-speech segments, used for training and evaluating VAD systems in telecommunication applications.
+"""
+
+# %% [markdown]
+"""
+### References
+
+- [Silero VAD Demonstration](https://thegradient.pub/one-voice-detector-to-rule-them-all/)
+- [Weak supervision, Wikipedia](https://en.wikipedia.org/wiki/Weak_supervision)
+- [Whisper datasets, Robust Speech Recognition via Large-Scale Weak Supervision](https://arxiv.org/abs/2212.04356)
+
+"""
+
+# %% [markdown]
+"""
+## Checklist of steps implemented in this notebook:
+
+- [x] Interactive audio player.
+- [x] Loading and re-sampling audio files with caching capability.
+- [x] Probability teacher (pseudo-labelling) with Silero VAD, with caching capability.
 - [x] Static and interactive plotting of audio waveforms and VAD probabilities.
 - [x] Find and download datasets.
-- [x] Save resampled audio array data loaded from datasets into `.npy` files.
-- [x] Render all dataset metadata statistics.
-- [x] Render individual dataset metadata statistics with player.
-- [x] Save taught probabilities into `.npy` files.
-- [x] Extract features
-- [x] Save features to `.npy` files.
-- [x] Stack features.
-- [x] Arrange balanced training and testing splits.
+- [x] Compute dataset metadata and statistics.
+- [x] Audio feature extraction with caching capability.
+- [x] Feature context stacking and aggregation.
 - [x] Model training pipeline.
-- [ ] Model evaluation pipeline.
+- [x] Model evaluation pipeline.
 """
 
 # %% [markdown]
@@ -28,10 +168,9 @@ WIP.
 Import of required libraries and modules to run cells in this notebook.
 """
 
-
 # %%
 def _configure_plotly_classic() -> None:
-    import plotly.io as pio  # noqa: E402
+    import plotly.io as pio 
 
     pio.renderers.default = "notebook_connected"
 
@@ -65,13 +204,38 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from IPython.display import display  # noqa: E402
 
+# %%
+!pip install git+https://github.com/KirilStrezikozin/torkius-vad.git
+!pip install silero-vad
+
+# %%
 from torkius_vad.plotting.widgets import play  # noqa: E402
 
+# %% [markdown]
+"""
+### Datasets metadata orchestration and handling.
+
+This section includes classes and methods for handling datasets metadata,
+including loading, caching metadata, and displaying statistics about the datasets.
+The `DatasetsMeta` class is responsible for orchestrating the metadata of all datasets,
+while the `DatasetMeta` class handles the metadata of individual datasets.
+
+### Note on Python patterns used
+This notebook makes heavy use of abstract base classes to define interfaces
+for implementations. There are not always multiple interchangeable implementations
+for each interface, but the pattern is enforced globally for consistency.
+
+Immutable data classes are utilized to represent audio data and its associated metadata.
+
+Generators and iterators are used for efficient data processing, especially when
+dealing with large datasets that cannot fit into memory.
+"""
 
 # %%
 class AbstractVisualizer(ABC):
     """
-    Abstract visualizer for data that can display any kind of visualization.
+    Abstract visualizer for data that can display
+    any kind of visualization.
     """
 
     @abstractmethod
@@ -275,14 +439,31 @@ class DatasetsMeta(AbstractVisualizer, AbstractDatasetsMeta):
         if groups:
             display(self._grouped_meta)
 
+# %% [markdown]
+"""
+### Display datasets metadata and statistics.
+
+Shows the metadata and statistics of the datasets, including total hours,
+number of files, and size of each dataset.
+"""
 
 # %%
 datasets_meta = DatasetsMeta()
 datasets_meta.show()
 
+# %% [markdown]
+"""
+### Orchestration of individual dataset metadata.
+
+This section includes the `DatasetMeta` class, which handles the metadata of individual datasets.
+It loads the metadata of a specific dataset, either from disk cache or by building it from the audio files.
+"""
 
 # %%
 class DatasetType(StrEnum):
+    """
+    Enum for dataset types.
+    """
     SPEECH = "speech"
     NONSPEECH = "nonspeech"
     MIX = "mix"
@@ -473,7 +654,7 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
     def show(self) -> None:
         display(self.dataset_meta)
 
-    def show_player(self, *, random_n: int = 1) -> None:
+    def show_player(self, *, random_n: int = 2) -> None:
         import random
 
         sample_slugs = random.sample(
@@ -491,6 +672,15 @@ class DatasetMeta(AbstractVisualizer, AbstractDatasetMeta):
             )
 
 
+# %% [markdown]
+"""
+### Building metadata for individual datasets.
+
+This section builds the metadata for each individual dataset by loading the audio files
+and computing the necessary statistics. The metadata is then cached to disk for faster
+loading in subsequent runs.
+"""
+
 # %%
 dataset_metas: dict[str, DatasetMeta] = {}
 
@@ -506,6 +696,14 @@ print(f"Total dataset metas built: {len(dataset_metas)}.")
 for name, meta in dataset_metas.items():
     print(f"- {name}: {len(meta.dataset_meta)} audio files.")
 
+# %% [markdown]
+"""
+### Displaying metadata and several random audio samples
+
+This section displays the metadata for each individual dataset and shows an interactive audio player
+for several random audio samples from each dataset.
+"""
+
 # %%
 import random  # noqa: E402
 
@@ -518,6 +716,20 @@ for dataset_name in sample_dataset_names:
     print("Showing audio player for 2 random samples:")
     dataset_meta.show_player(random_n=2)
 
+# %% [markdown]
+"""
+### Audio data representation and processing pipeline.
+
+This section defines the `AudioData` data class, which represents the audio data and its associated metadata.
+
+The `AbstractAudioLoader` and `AbstractProbabilityTeacher` classes define the interfaces for loading audio data and teaching probabilities, respectively.
+
+`AudioLoader` is an implementation of `AbstractAudioLoader` that loads audio files, converts them to mono, and resamples them to a target sample rate.
+
+`NonSpeechProbabilityTeacher` is an implementation of `AbstractProbabilityTeacher` that generates pseudo-labels for non-speech audio segments.
+
+`SileroProbabilityTeacher` is an implementation of `AbstractProbabilityTeacher` that uses the Silero VAD model to generate pseudo-labels for speech and non-speech audio segments.
+"""
 
 # %%
 @dataclass(frozen=True)
@@ -872,8 +1084,73 @@ class SileroProbabilityTeacher(AbstractProbabilityTeacher):
 
         return audio_data.with_taught_probas(taught_probas=taught_probas)
 
+class UnthresholdedSileroProbabilityTeacher(SileroProbabilityTeacher):
+    def teach(self, *, audio_data: AudioData) -> AudioData:
+        from time import time
+
+        import numpy as np
+        import torch
+        from silero_vad import get_speech_timestamps
+
+        fmt_err = "Audio data must contain {} for teaching probabilities."
+        if audio_data.audio is None:
+            raise ValueError(fmt_err.format("audio samples"))
+        elif audio_data.sr is None:
+            raise ValueError(fmt_err.format("sampling rate"))
+
+        s0 = time()
+        audio = audio_data.audio
+        audio_tensor = torch.from_numpy(audio).to(self.device)
+
+        speech_probs = []
+        window_size_samples = 512 if audio_data.sr == 16000 else 256
+        for current_start_sample in range(0, len(audio), window_size_samples):
+            chunk = audio_tensor[current_start_sample: current_start_sample + window_size_samples]
+            if len(chunk) < window_size_samples:
+                break
+            speech_prob = self._model(chunk, audio_data.sr).item()
+            speech_probs.append(speech_prob)
+
+
+        aligned_probs = []
+        for i in range(0, len(audio), audio_data.chunk_size):
+            frame_center = i + audio_data.chunk_size // 2
+            silero_idx = frame_center // window_size_samples
+
+            if silero_idx < len(speech_probs):
+                aligned_probs.append(speech_probs[silero_idx])
+
+        s1 = time()
+
+        # Statistics.
+        self._avg_teach_n += 1
+        self._avg_teach_time = (
+            (self._avg_teach_n - 1) * self._avg_teach_time + (s1 - s0)
+        ) / self._avg_teach_n
+
+        if self._print_stats:
+            print(f"Teaching with Silero VAD completed in {s1 - s0:.3f}s.")
+            print(
+                f"Average teaching time over {self._avg_teach_n} runs: "
+                f"{self._avg_teach_time:.3f}s.",
+            )
+
+        return audio_data.with_taught_probas(taught_probas=aligned_probs)
+
 
 class MixAvaDatasetProbabilityTeacher(AbstractProbabilityTeacher):
+    """
+    An alternative to Silero VAD teacher that uses the Mix-AVA dataset
+    annotations to generate pseudo-labels for speech and non-speech audio
+    segments.
+
+    Note: This teacher is specifically designed for the Mix-AVA dataset
+    and expects the audio files to have corresponding JSON metadata files with
+    "onset" and "offset" annotations for speech segments. It will generate
+    binary pseudo-labels based on these annotations, snapping to the closest
+    probability step (0.0, 0.5, 1.0) for the start and end of speech segments.
+    """
+
     def __init__(
         self,
         *,
@@ -966,6 +1243,27 @@ class MixAvaDatasetProbabilityTeacher(AbstractProbabilityTeacher):
 
         return audio_data.with_taught_probas(taught_probas=taught_probas)
 
+# %% [markdown]
+"""
+### Dataset orchestration
+
+After implementing audio loaders and teachers for one audio file, the next
+sections define orchestration classes that handle the loading and teaching of
+audio data for entire datasets.
+"""
+
+# %% [markdown]
+"""
+### Dataset audio loading pipeline.
+
+This section defines the `AbstractDatasetAudioLoader` and `DatasetAudioLoader` classes, which handle the loading of audio data for each dataset.
+
+The `DatasetAudioLoader` class attempts to load pre-processed audio data from disk cache for faster loading. If the cache is not available or invalid, it builds the audio data from the source audio files using the provided `AbstractAudioLoader` implementation. The loaded audio data is then cached to disk for future runs if disk caching is enabled.
+
+In practice, one would typically not use caching for audio loading, since
+loading and re-sampling it is usually not a bottleneck and caching will consume
+the same amount of disk space as the original audio files.
+"""
 
 # %%
 class AbstractDatasetAudioLoader(ABC):
@@ -1125,6 +1423,17 @@ class DatasetAudioLoader(AbstractDatasetAudioLoader):
 
         return
 
+# %% [markdown]
+"""
+### Dataset audio teaching pipeline.
+
+This section defines the `AbstractDatasetAudioTeacher` and `DatasetAudioTeacher` classes, which handle the teaching of probabilities for each dataset.
+
+The `DatasetAudioTeacher` class attempts to load pre-computed taught probabilities from disk cache for faster loading. If the cache is not available or invalid, it builds the taught probabilities from the source audio files using the provided `AbstractProbabilityTeacher` implementation. The taught probabilities are then cached to disk for future runs if disk caching is enabled.
+
+The caching is quite useful here and avoids the need to run the expensive teaching
+process.
+"""
 
 # %%
 class AbstractDatasetAudioTeacher(ABC):
@@ -1310,6 +1619,33 @@ class DatasetAudioTeacher(AbstractDatasetAudioTeacher):
 
         return
 
+# %% [markdown]
+"""
+### Audio frame generation and feature extraction.
+
+The next step in the pipeline is to generate audio frames from the loaded audio data and extract features from those frames. The following classes handle these steps:
+- `AbstractAudioFrameGenerator` and `AudioFrameGenerator`: These classes define the interface and implementation for generating audio frames from the loaded audio data. The `AudioFrameGenerator` class divides the audio samples into non-overlapping frames based on the specified chunk size.
+- `AbstractAudioFeatureExtractor` and `AudioFeatureExtractor`: These classes define the interface and implementation for extracting features from the generated audio frames.
+
+The `AudioFeatureExtractor` class applies a Hamming window to each frame, computes the FFT spectrum, along with the following features:
+- Zero-crossing rate (ZCR) - represents the rate at which the signal changes sign, which can indicate the presence of speech.
+- Centroid - represents the "center of mass" of the spectrum, which can indicate the brightness of the sound.
+- Tonality - represents the degree to which the sound is tonal (harmonic) versus noisy, which can help distinguish speech from noise.
+- Peaks - represents the number of peaks in the spectrum, which can indicate the complexity of the sound.
+- Flux - represents the amount of spectral change between consecutive frames, which can indicate the presence of speech.
+- Dominant frequency ratio - represents the ratio of the dominant frequency to the total energy in the spectrum, which can indicate the presence of speech or pure tones.
+- Log energy - represents the logarithm of the total energy in the frame, which can indicate the presence of speech.
+
+There are MFCCs and Mel-spectrogram features as well, but they are currently disabled to save time and because they did not seem to improve the results in preliminary experiments. They can be easily re-enabled by uncommenting the relevant lines in the `_calc_feat_vec` method of the `AudioFeatureExtractor` class.
+
+### Early normalization
+
+The log energy and flux features are normalized during extraction, using
+running mean and variance and `fahn` normalization. This is done because the
+scale of these features varies significantly and is order of magnitude higher than
+the other features, which makes training completely unstable, even with
+fitted scalers.
+"""
 
 # %%
 class AbstractAudioFrameGenerator(ABC):
@@ -1562,6 +1898,22 @@ class AudioFeatureExtractor(AbstractAudioFeatureExtractor):
 
         return feat_vec, fft_spectrum, mean_energy, mean2_energy, mean_flux, mean2_flux
 
+# %% [markdown]
+"""
+### Feature scaling and contextual statistics.
+
+The next step in the pipeline is to apply feature scaling and compute contextual statistics for the extracted features. The following classes handle these steps:
+- `ScalerProtocol`: A protocol that defines the interface for feature scalers, which can be used to normalize the features before feeding them into the model.
+- `AbstractFeatureCompute` and `FeatureWithContextStats`: These classes define the interface and implementation for computing contextual statistics for the extracted features. The `FeatureWithContextStats` class maintains a buffer of the most recent feature vectors and computes statistics such as mean and standard deviation over this buffer to capture the temporal context of the features. The computed statistics are then concatenated with the original feature vector to form an augmented feature vector that can provide the model with more information about the temporal dynamics of the audio signal.
+- `FeatureWithVariableContextStats`: An extension of `FeatureWithContextStats` that allows for computing statistics over variable context sizes for different subsets of features. This can be useful if certain features benefit from longer or shorter context windows.
+- `FeatureSelector`: A class that selects specific features from the computed feature vector based on a provided selection dictionary. This can be used to reduce the dimensionality of the feature vector and to filter out less relevant features without modifying the extraction pipeline.
+
+### Observations
+
+During experimentation, it was observed that mean and standard deviation statistics were sufficient.
+The context window size significantly affects the trained model performance. A smaller 
+window size results in higher reaction to signal changes, but the model misses longer-term signal patterns and trends, thus performing poorly. A larger window size captures more temporal context and results in excellent performance, but it slows down the reaction to signal changes.
+"""
 
 # %%
 class ScalerProtocol(Protocol):
@@ -1570,40 +1922,6 @@ class ScalerProtocol(Protocol):
     def transform(self, X: np.ndarray) -> np.ndarray: ...
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray: ...
-
-
-class StdScaler(ScalerProtocol):
-    def __init__(self):
-        self._count = 0
-        self._mean = None
-        self._m2 = None
-
-    def _ensure_init(self, X: np.ndarray) -> None:
-        if self._mean is None or self._m2 is None:
-            n_features = X.shape[1]
-            self._mean = np.zeros(n_features, dtype=np.float64)
-            # Sum of squares of differences.
-            self._m2 = np.zeros(n_features, dtype=np.float64)
-
-    def partial_fit(self, X: np.ndarray) -> None:
-        self._ensure_init(X)
-        for x in X:
-            self._count += 1
-            delta = x - self._mean
-            self._mean += delta / self._count
-            delta2 = x - self._mean
-            self._m2 += delta * delta2
-
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        self._ensure_init(X)
-        std = np.sqrt(self._m2 / np.maximum(self._count - 1, 1))
-        std[std < 1e-8] = 1.0  # Avoid division by zero.
-        return (X - self._mean) / std
-
-    def fit_transform(self, X: np.ndarray) -> np.ndarray:
-        self.partial_fit(X)
-        return self.transform(X)
-
 
 # %%
 class AbstractFeatureCompute(ABC):
@@ -1623,16 +1941,6 @@ class FeatureWithContextStats(AbstractFeatureCompute):
         self._context_size = context_size
         self._buf = deque(maxlen=context_size + 1)
 
-        # self._energy_buf = deque(maxlen=context_size * 1)
-        # self._mod_var_buf = deque(maxlen=context_size * 1)
-        # self._mod_sos = butter(
-        #     N=2,
-        #     Wn=[4.0, 16.0],
-        #     btype="bandpass",
-        #     fs=100.0,
-        #     output="sos",
-        # )
-
     def compute(self, *, feat_vec: np.ndarray) -> np.ndarray:
         import numpy as np
         from scipy.signal import sosfilt
@@ -1640,42 +1948,13 @@ class FeatureWithContextStats(AbstractFeatureCompute):
         self._buf.append(feat_vec)
         buf_array = np.vstack(self._buf)
 
-        # if buf_array.shape[0] < 2:
-        #     return np.zeros(
-        #         feat_vec.shape[0] * 2 + 1,  # mean + var + mod_var
-        #         dtype=np.float32,
-        #     )
-
-        # self._energy_buf.append(feat_vec[-1])
-        # assert self._energy_buf.maxlen is not None
-        # if len(self._energy_buf) < self._energy_buf.maxlen:
-        #     mod_var = 0.0
-        # else:
-        #     energy_seq = np.array(self._energy_buf, dtype=np.float32)
-        #     mod_energy_seq = sosfilt(self._mod_sos, energy_seq)
-        #     mod_var = np.var(mod_energy_seq)
-        #
-        # self._mod_var_buf.append(mod_var)
-
         mean_vec = np.mean(buf_array, axis=0)
-        # mean_mod_var = np.mean(np.array(self._mod_var_buf, dtype=np.float32))
         std_vec = np.std(buf_array, axis=0)
-        # var_vec = np.var(buf_array, axis=0, ddof=0)
-        # var_mod_var = np.var(np.array(self._mod_var_buf, dtype=np.float32), ddof=0)
-        # var_vec = np.nan_to_num(var_vec, nan=0.0)
-        # min_vec = np.min(buf_array, axis=0)
-        # max_vec = np.max(buf_array, axis=0)
 
         feat_with_stats = np.hstack(
             [
-                # feat_vec,
                 mean_vec,
-                # mean_mod_var,
                 std_vec,
-                # var_vec,
-                # var_mod_var,
-                # min_vec,
-                # max_vec,
             ]
         ).astype(np.float32)
         return feat_with_stats
@@ -1752,6 +2031,14 @@ class FeatureSelector(AbstractFeatureCompute):
     def reset(self) -> None:
         self._feature_compute.reset()
 
+# %% [markdown]
+"""
+### Dataset audio feature extraction pipeline.
+
+This section defines the `AbstractDatasetAudioFeatureExtractor` and `DatasetAudioFeatureExtractor` classes, which handle the feature extraction for each dataset.
+
+The `DatasetAudioFeatureExtractor` class attempts to load pre-extracted feature vectors from disk cache for faster loading. If the cache is not available or invalid, it builds the feature vectors from the source audio files using the provided `AbstractAudioFeatureExtractor` implementation. The extracted feature vectors are then cached to disk for future runs if disk caching is enabled.
+"""
 
 # %%
 class AbstractDatasetAudioFeatureExtractor(ABC):
@@ -1913,52 +2200,14 @@ class DatasetAudioFeatureExtractor(AbstractDatasetAudioFeatureExtractor):
 
         return
 
+# %% [markdown]
+"""
+### Dataset audio processing pipelines.
 
-# %%
-dataset_loader = DatasetAudioLoader(
-    audio_loader=AudioLoader(print_stats=True),
-    target_sr=8000,
-    chunk_size=int(0.01 * 8000),  # 10 ms chunks
-    use_disk_cache=False,
-    print_stats=True,
-)
+The `DatasetAudioPipeline` class defines a simple pipeline that processes the dataset by loading the audio data, teaching probabilities, and extracting features. It iterates through the processed audio data but does not perform any further operations on it.
 
-noop_dataset_loader = DatasetAudioLoader(
-    audio_loader=NoopAudioLoader(print_stats=True),
-    target_sr=8000,
-    chunk_size=int(0.01 * 8000),  # 10 ms chunks
-    use_disk_cache=False,
-    print_stats=True,
-)
-
-
-def make_nonspeech_dataset_teacher() -> DatasetAudioTeacher:
-    print("Creating Non-Speech Dataset Teacher...")
-    return DatasetAudioTeacher(
-        probability_teacher=NonSpeechProbabilityTeacher(print_stats=False),
-        use_disk_cache=True,
-        print_stats=True,
-    )
-
-
-def make_mix_dataset_teacher() -> DatasetAudioTeacher:
-    print("Creating Mix Dataset Teacher...")
-    return DatasetAudioTeacher(
-        probability_teacher=SileroProbabilityTeacher(
-            print_stats=False, print_init_stats=True
-        ),
-        use_disk_cache=True,
-        print_stats=True,
-    )
-
-
-dataset_feature_extractor = DatasetAudioFeatureExtractor(
-    feature_extractor=AudioFeatureExtractor(),
-    frame_generator=AudioFrameGenerator(),
-    use_disk_cache=True,
-    print_stats=True,
-)
-
+The `DatasetPartialLearningPipeline` class extends the functionality of the `DatasetAudioPipeline` by allowing for partial learning. It processes the dataset in a similar way but yields tuples of feature vectors, taught probabilities, and metadata for each audio file. This allows for more flexible training and evaluation, as the yielded data can be used to train models incrementally or to perform analysis on specific subsets of the dataset. The `DatasetPartialLearningPipelineY` class is a variant of the `DatasetPartialLearningPipeline` that yields `None` for the feature vectors, which can be useful for scenarios where only the taught probabilities and metadata are needed, such as in certain evaluation or analysis tasks.
+"""
 
 # %%
 class AbstractDatasetAudioPipeline(ABC):
@@ -2172,9 +2421,22 @@ class DatasetPartialLearningPipelineY:
             yield None, y, sample_metadata
 
 
+# %% [markdown]
+"""
+### Offline prediction with SGDClassifier.
+
+The `AbstractOfflinePredictor` class defines the interface for offline predictors, which take in audio data and produce predictions based on the extracted features. The `AbstractPredictionModel` class defines the interface for prediction models, which can compute decision functions and predicted probabilities from feature vectors.
+
+The `SGDClassifierModel` class is a concrete implementation of the `AbstractPredictionModel` interface that wraps around a scikit-learn `SGDClassifier`. It implements the `decision_function` and `predict_proba` methods by calling the corresponding methods on the underlying model.
+
+The `SGDEnsembleModel` class is an ensemble implementation of the `AbstractPredictionModel` interface that takes a list of `SGDClassifier` models and averages their decision functions to produce a final prediction. The `SGDEnsembleModel2` class is a variant that averages the predicted probabilities instead of the decision functions.
+
+The `BaseOfflineSGDPredictor` class is a concrete implementation of the `AbstractOfflinePredictor` interface that uses an `AbstractPredictionModel` to make predictions on audio data. It takes in a model, a scaler for feature normalization, and a feature compute for computing contextual statistics. The `predict` method extracts features from the audio data, applies scaling, and then uses the model to compute predicted probabilities, which are then attached to the audio data for further use.
+"""
+
 # %%
 from sklearn.linear_model import SGDClassifier  # noqa: E402
-from sklearn.preprocessing import StandardScaler, RobustScaler  # noqa: E402
+from sklearn.preprocessing import StandardScaler  # noqa: E402
 
 
 class AbstractOfflinePredictor(ABC):
@@ -2291,8 +2553,8 @@ class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
 
         s0 = time()
         X = self._scaler.transform(X)
-        # y_pred = self.predict_proba(X=X)
-        y_pred = self.decision_function(X=X)
+        y_pred = self.predict_proba(X=X)
+        # y_pred = self.decision_function(X=X)
         s1 = time()
 
         if self._print_stats:
@@ -2313,6 +2575,48 @@ class BaseOfflineSGDPredictor(AbstractOfflinePredictor):
 
         return audio_data.with_predicted_probas(predicted_probas=y_pred)
 
+class OfflineXGBoostPredictor(AbstractOfflinePredictor):
+    def __init__(
+        self,
+        *,
+        model: AbstractPredictionModel,
+        feature_compute: AbstractFeatureCompute,
+        print_stats: bool = True,
+    ) -> None:
+        self._model = model
+        self._feature_compute = feature_compute
+        self._print_stats = print_stats
+
+    def predict(self, *, audio_data: AudioData) -> AudioData:
+        fmt_err = "Audio data must contain {} for prediction."
+        if audio_data.feat_vectors is None:
+            raise ValueError(fmt_err.format("feature vectors"))
+
+        self._feature_compute.reset()
+        X = np.array(
+            [
+                self._feature_compute.compute(feat_vec=feat_vec)
+                for feat_vec in audio_data.feat_vectors
+            ],
+            dtype=np.float32,
+        )
+        self._feature_compute.reset()
+
+        s0 = time()
+        y_pred = self._model.predict_proba(X=X)[:, 1]
+        s1 = time()
+
+        if self._print_stats:
+            print(f"Predicted probabilities in {s1 - s0:.3f}s.")
+
+        return audio_data.with_predicted_probas(predicted_probas=y_pred)
+
+# %% [markdown]
+"""
+### Dataset audio pipeline manager.
+
+The `DatasetAudioPipelineManager` class manages the execution of the audio processing pipelines for multiple datasets. It takes in a dataset audio pipeline, metadata for the datasets, a dataset loader, a dictionary of teacher factories for each dataset, and a dataset feature extractor. The `run` method executes the pipeline for each dataset in parallel using joblib's `Parallel` and `delayed` functions. The `_run_one` method processes an individual dataset by checking if it should be processed based on the provided criteria (such as being in the 'only' list or having an available teacher) and then running the audio pipeline with the appropriate components.
+"""
 
 # %%
 class DatasetAudioPipelineManager:
@@ -2369,9 +2673,74 @@ class DatasetAudioPipelineManager:
             dataset_feature_extractor=self._dataset_feature_extractor,
         )
 
+# %% [markdown]
+"""
+### The beginning. Loaders and teachers
+
+From this section onwards, the actual training and evaluation pipelines are defined.
+Here, loaders, teachers, and a feature extractor is created for individual audio files.
+"""
+
+# %%
+dataset_loader = DatasetAudioLoader(
+    audio_loader=AudioLoader(print_stats=True),
+    target_sr=8000,
+    chunk_size=int(0.01 * 8000),  # 10 ms chunks
+    use_disk_cache=False,
+    print_stats=True,
+)
+
+noop_dataset_loader = DatasetAudioLoader(
+    audio_loader=NoopAudioLoader(print_stats=True),
+    target_sr=8000,
+    chunk_size=int(0.01 * 8000),  # 10 ms chunks
+    use_disk_cache=False,
+    print_stats=True,
+)
+
+
+def make_nonspeech_dataset_teacher() -> DatasetAudioTeacher:
+    print("Creating Non-Speech Dataset Teacher...")
+    return DatasetAudioTeacher(
+        probability_teacher=NonSpeechProbabilityTeacher(print_stats=False),
+        use_disk_cache=True,
+        print_stats=True,
+    )
+
+
+def make_mix_dataset_teacher() -> DatasetAudioTeacher:
+    print("Creating Mix Dataset Teacher...")
+    return DatasetAudioTeacher(
+        probability_teacher=SileroProbabilityTeacher(
+            print_stats=False, print_init_stats=True
+        ),
+        use_disk_cache=True,
+        print_stats=True,
+    )
+
+
+dataset_feature_extractor = DatasetAudioFeatureExtractor(
+    feature_extractor=AudioFeatureExtractor(),
+    frame_generator=AudioFrameGenerator(),
+    use_disk_cache=True,
+    print_stats=True,
+)
+
+# %% [markdown]
+"""
+### Display the metadata once again
+"""
 
 # %%
 datasets_meta.show(groups=True)
+
+# %% [markdown]
+"""
+### Run the dataset audio processing pipelines.
+
+This cell will load audio files, ensure the teachers labelled the data,
+and ensure the features are extracted. This can take a while.
+"""
 
 # %%
 dataset_audio_pipeline = DatasetAudioPipeline(print_stats=True)
@@ -2395,6 +2764,15 @@ pipeline_manager = DatasetAudioPipelineManager(
 
 pipeline_manager.run()
 
+# %% [markdown]
+"""
+### Define models and feature compute for training and evaluation.
+
+Here, a list of `SGDClassifier` models with different regularization strengths (alphas) is created.
+This is an experimentationl setup to train multiple models at once to compare their performance.
+This is not how the final model is selected.
+"""
+
 # %%
 from sklearn.linear_model import SGDClassifier  # noqa: E402
 
@@ -2411,30 +2789,49 @@ alphas = [
     3e-2,
 ]
 class_weights = [
+    # {0.0: 1.0, 1.0: 1.0},
+    # {0.0: 1.5, 1.0: 1.0},
+    # {0.0: 2.0, 1.0: 1.0},
+    # {0.0: 1.0, 1.0: 1.0},
+    # {0.0: 1.0, 1.0: 1.5},
+    # {0.0: 1.0, 1.0: 2.0},
+    # {0.0: 1.0, 1.0: 1.0},
+    # {0.0: 1.5, 1.0: 1.0},
+    # {0.0: 1.0, 1.0: 1.0},
+    # {0.0: 1.0, 1.0: 1.5},
     {0.0: 1.0, 1.0: 1.0},
-    {0.0: 1.5, 1.0: 1.0},
-    {0.0: 2.0, 1.0: 1.0},
     {0.0: 1.0, 1.0: 1.0},
-    {0.0: 1.0, 1.0: 1.5},
-    {0.0: 1.0, 1.0: 2.0},
     {0.0: 1.0, 1.0: 1.0},
-    {0.0: 1.5, 1.0: 1.0},
     {0.0: 1.0, 1.0: 1.0},
-    {0.0: 1.0, 1.0: 1.5},
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.0},
+    {0.0: 1.0, 1.0: 1.0},
 ]
 models = [
     SGDClassifier(
         loss="log_loss",
         learning_rate="optimal",
         alpha=alpha,
-        penalty="l1",
-        tol=1e-4,
+        penalty="l2",
+        # tol=1e-4,
         warm_start=True,
     )
     for _, alpha in enumerate(alphas)
 ]
 for model, class_weight in zip(models, class_weights):
     model.set_params(class_weight=class_weight)
+
+# %% [markdown]
+"""
+### Feature filtering and learning pipelines
+
+This cell creates feature compute and selectors for filtering.
+
+Then, online learning pipelines are created.
+"""
 
 # %%
 from time import time  # noqa: E402
@@ -2679,6 +3076,15 @@ def make_training_learners() -> dict[str, tuple[DatasetMeta, bool, Generator]]:
 def make_fine_tuning_learners() -> dict[str, tuple[DatasetMeta, bool, Generator]]:
     return make_training_learners()
 
+# %% [markdown]
+"""
+### Round-robin sampling from multiple learners.
+
+The datasets are large, such that will very likely not not fit into RAM.
+Hence, the model is trained partially on one audio file at a time. To improve
+the balance and better fitting, the samples from all datasets are interleaved
+in a round-robin manner. This improves performance and class balance.
+"""
 
 # %%
 def round_robin_sampling(
@@ -2702,11 +3108,16 @@ def round_robin_sampling(
                 break
             continue
 
+# %% [markdown]
+"""
+### Scaler fitting.
+
+The next two cells perform the fitting of the `StandardScaler` on the training data. This is done in an online manner. `round_robin_sampling` is here for consistency with actual training, but
+can be skipped since the scaler will ultimately fit all training data.
+"""
 
 # %%
-# scaler = StandardScaler()
-rscaler = RobustScaler()
-rscaler.fit(np.vstack(XX))
+scaler = StandardScaler()
 
 # %%
 s0 = time()
@@ -2718,8 +3129,8 @@ for dataset_meta, X, y, meta in round_robin_sampling(
     if not meta.is_train:
         continue
     t0 = time()
-    rscaler.fit(XX)
-    # XX.append(X)
+    scaler.partial_fit(X)
+    XX.append(X) # if one plans to store X samples.
 
     print(f"Fitted in {time() - t0:.3f}s.")
     print(
@@ -2730,17 +3141,18 @@ for dataset_meta, X, y, meta in round_robin_sampling(
 print(f"Total scaler fitting time: {time() - s0:.3f}s.")
 print(len(XX))
 
-# %%
-import pickle
+# %% [markdown]
+"""
+### Online learning.
 
-with open("./XX.pkl", "wb") as f:
-    pickle.dump(XX, f)
-
+The next cell performs the online learning of the `SGDClassifier` models. The samples are taken in a round-robin manner from all datasets to improve balance and performance. The features are transformed using the fitted scaler before being used for training.
+"""
 
 # %%
 s0 = time()
 # to_predict = []
 i = -1
+yy = []
 for dataset_meta, _, y, meta in round_robin_sampling(
     make_training_learners(),
     stop_on_first_exhausted=True,
@@ -2749,10 +3161,11 @@ for dataset_meta, _, y, meta in round_robin_sampling(
         # to_predict.append((dataset_meta, X, y, meta))
         continue
     i += 1
-    X = XX[i]
+    X = XX[i] # if X samples are already loaded and stored.
+    yy.append(y) # If one plans to store y samples.
     print(y.shape, X.shape)
     t0 = time()
-    Xs = rscaler.transform(X)
+    Xs = scaler.transform(X)
     for clf in models:
         clf.partial_fit(Xs, y, classes=[0.0, 1.0])
 
@@ -2764,186 +3177,392 @@ for dataset_meta, _, y, meta in round_robin_sampling(
     )
 print(f"Total learning time: {time() - s0:.3f}s.")
 
-# %%
-for clf in models:
-    clf.alpha *= 0.1  # Stabilize.
-    clf.set_params(class_weight={0.0: 1.5, 1.0: 1.0})
-    # print(clf.get_params())
-
-# %%
-# Fine-tuning.
-s0 = time()
-for dataset_meta, X, y, meta in round_robin_sampling(
-    make_fine_tuning_learners(),
-    stop_on_first_exhausted=True,
-):
-    if not meta.is_train:
-        continue
-
-    t0 = time()
-    Xs = scaler.transform(X)
-    for clf in models:
-        clf.partial_fit(Xs, y, classes=[0.0, 1.0])
-
-    print(f"Fine-tuned in {time() - t0:.3f}s.")
-    print(
-        f"{meta.samples_slug}: Sample {meta.samples_index + 1}/{meta.samples_total} ",
-    )
-print(f"Total fine-tuning time: {time() - s0:.3f}s.")
-
-# %%
-import pickle  # noqa: E402
-from datetime import datetime  # noqa: E402
-
-with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
-    pickle.dump(
-        {
-            "scaler": scaler,
-            "classifier": models,
-            "comment": ("TODO large window (fix)"),
-        },
-        f,
-    )
-
-# %%
-import pickle  # noqa: E402
-from datetime import datetime  # noqa: E402
-
-with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
-    pickle.dump(
-        {
-            "scaler": scaler,
-            "classifier": models,
-            "comment": (
-                "Ensemble of SGDClassifiers trained on all datasets. "
-                "Various but fixed hyperparameters: alphas and class weights. "
-                "Removed log energy, left mel energy. Added flux back, "
-                "added delta and flux varience to statistics. Increased context "
-                "from 100 to 200ms. Online learning on samples "
-                "from datasets in round-robin fashion. With 2 epochs."
-            ),
-        },
-        f,
-    )
-
-# %%
-import pickle  # noqa: E402
-from datetime import datetime  # noqa: E402
-
-with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
-    pickle.dump(
-        {
-            "scaler": scaler,
-            "classifier": models,
-            "comment": (
-                "Ensemble of SGDClassifiers trained on all datasets. "
-                "Removed flatness, rolloff, flux. Added variance to context. "
-                "Increased context from 50 to 100ms. Online learning on samples "
-                "from datasets in round-robin fashion. "
-                "Results: very low probabilities for non-speech segments, "
-                "including tones and music, but confidence"
-                "on speech segments is low.",
-            ),
-        },
-        f,
-    )
-
-# %%
-import pickle  # noqa: E402
-from datetime import datetime  # noqa: E402
-
-with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
-    pickle.dump(
-        {
-            "scaler": scaler,
-            "classifier": models,
-            "comment": (
-                "Ensemble of SGDClassifiers trained on all datasets. "
-                "Removed MFCCs, added tonality and peaks features. "
-                "Implemented custom scaler. Online learning on samples "
-                "from datasets in round-robin fashion. "
-                "Results: low probabilities for non-speech segments, ",
-                "including music, but confidence on speech segments could be higher.",
-            ),
-        },
-        f,
-    )
-
-# %%
-with open("model_20260125_232737.pkl", "rb") as f:
-    saved_data = pickle.load(f)
-    saved_data["comment"] = (
-        "Ensemble of SGDClassifiers trained on all datasets. "
-        "MFCCs, scaler trained during main training, "
-        "online learning on datasets in sequential fashion. "
-        "Results: probabilities for non-speech segments could be lower, "
-        "confidence on speech segments could be higher. "
-        "Symptoms: overfitting on music segments, instable scaling."
-    )
-with open("model_20260125_232737.pkl", "wb") as f:
-    pickle.dump(saved_data, f)
-    print(saved_data["comment"])
-
-# %%
-with open("to_predict.pkl", "wb") as f:
-    pickle.dump(to_predict, f)
 
 # %%
 import pickle
 
-# with open("to_predict.pkl", "rb") as f:
-#    to_predict = pickle.load(f)
-with open("model_20260205_151940.pkl", "rb") as f:
+# with open("./XX1.pkl", "wb") as f:
+#     pickle.dump(XX, f)
+
+# with open("./YY1.pkl", "wb") as f:
+#     pickle.dump(yy, f)
+
+with open("./XX1.pkl", "rb") as f:
+    XX = pickle.load(f)
+with open("./YY1.pkl", "rb") as f:
+    yy = pickle.load(f)
+
+# %% [markdown]
+"""
+### Offline learning.
+
+Once the feature set is fixed, different models can be evaluated much quicker
+and easily in an offline manner. For this, `X` and `y` samples are collected in the previous online learning step to avoid recomputing them again, sicne context aggregation is not cached and takes a while.
+"""
+
+# %%
+from sklearn.pipeline import Pipeline  # noqa: E402
+from sklearn.preprocessing import StandardScaler  # noqa: E402
+from sklearn.linear_model import SGDClassifier  # noqa: E402
+from sklearn.ensemble import VotingClassifier  # noqa: E402
+from xgboost import XGBClassifier  # noqa: E402
+
+# %% [markdown]
+"""
+### Pipelines.
+
+The following pipelines are defined for evaluation:
+1. A single `SGDClassifier` with a specific set of hyperparameters.
+2. An ensemble of `SGDClassifier` models with different regularization strengths (alphas) and class weights, using soft voting.
+3. An `XGBClassifier` with specific hyperparameters.
+
+`RandomForestClassifier` was not selected due to long training time.
+"""
+
+# %%
+pipeline = Pipeline(
+    [
+        ("scaler", StandardScaler()),
+        (
+            "classifier",
+            SGDClassifier(
+                loss="log_loss",
+                learning_rate="optimal",
+                alpha=1e-4,
+                penalty="l2",
+                class_weight="balanced",
+                n_jobs=-1,
+            ),
+        ),
+    ],
+)
+# %%
+pipeline = Pipeline(
+    [
+        ("scaler", StandardScaler()),
+        (
+            "classifier",
+            VotingClassifier(
+                estimators=[
+                    (f"sgd_{i}", model)
+                    for i, model in enumerate(
+                        [
+                            SGDClassifier(
+                                loss="log_loss",
+                                learning_rate="optimal",
+                                alpha=alpha,
+                                penalty="l2",
+                                class_weight="balanced",
+                                n_jobs=-1,
+                            )
+                            for alpha in alphas
+                        ]
+                    )
+                ],
+                voting="soft",
+                n_jobs=-1,
+            ),
+        ),
+    ],
+)
+# %%
+pipeline = Pipeline(
+    [
+        ("scaler", StandardScaler()),
+        (
+            "classifier",
+            XGBClassifier(
+                max_depth=8,
+                n_jobs=12,
+                n_estimators=500,
+                eval_metric="logloss",
+                tree_method="hist",
+                class_weight="balanced",
+            ),
+        ),
+    ],
+)
+
+# %%
+XX_ = np.vstack(XX)
+print(len(XX), XX_.shape, XX[0].shape)
+# %%
+yy_ = np.concatenate(yy)
+print(len(yy), yy_.shape, yy[0].shape)
+# %%
+from sklearn.model_selection import train_test_split  # noqa: E402
+X_train, X_test, y_train, y_test = train_test_split(
+    XX_,
+    yy_,
+    test_size=0.2,
+    random_state=42,
+    stratify=yy_,
+)
+# %%
+pipeline.fit(X_train, y_train)
+
+# %% [markdown]
+"""
+### Evaluation.
+
+The following metrics are computed on the test set:
+1. Classification report (precision, recall, f1-score).
+2. Confusion matrix.
+3. ROC AUC score.
+"""
+
+# %%
+from sklearn.metrics import classification_report  # noqa: E402
+from sklearn.metrics import confusion_matrix  # noqa: E402
+from sklearn.metrics import roc_auc_score  # noqa: E402
+# %%
+
+y_pred = pipeline.predict(X_test)
+print(classification_report(y_test, y_pred))
+print(confusion_matrix(y_test, y_pred))
+
+# %%
+print(roc_auc_score(y_test, pipeline.predict_proba(X_test)[:, 1]))
+
+# %%
+# Plot a ROC curve
+import matplotlib.pyplot as plt  # noqa: E402
+from sklearn.metrics import RocCurveDisplay  # noqa: E402
+
+RocCurveDisplay.from_estimator(
+    model,
+    X_test,
+    y_test,
+)
+plt.show()
+
+# %% [markdown]
+"""
+### Results
+
+```
+SGDClasifier - baseline, log_loss.
+========================================================
+
+              precision    recall  f1-score   support
+
+         0.0       0.78      0.64      0.70  13524017
+         1.0       0.80      0.88      0.84  21570252
+
+    accuracy                           0.79  35094269
+   macro avg       0.79      0.76      0.77  35094269
+weighted avg       0.79      0.79      0.78  35094269
+
+[[ 8644813  4879204]
+ [ 2505718 19064534]]
+
+roc=0.845849912069585
+
+
+SGDClasifier - log_loss, l2, balanced class weight
+========================================================
+
+              precision    recall  f1-score   support
+
+         0.0       0.70      0.75      0.72  13524017
+         1.0       0.83      0.79      0.81  21570252
+
+    accuracy                           0.78  35094269
+   macro avg       0.77      0.77      0.77  35094269
+weighted avg       0.78      0.78      0.78  35094269
+
+[[10132205  3391812]
+ [ 4438565 17131687]]
+
+roc=0.8459882135678315
+
+
+10 SGDClasifiers with soft voting.
+========================================================
+
+              precision    recall  f1-score   support
+
+         0.0       0.69      0.75      0.72  13524017
+         1.0       0.84      0.79      0.81  21570252
+
+    accuracy                           0.77  35094269
+   macro avg       0.76      0.77      0.77  35094269
+weighted avg       0.78      0.77      0.78  35094269
+
+[[10187874  3336143]
+ [ 4588512 16981740]]
+
+roc=0.845650607462749
+
+
+XGBoostClassifier - max_depth=6
+========================================================
+
+              precision    recall  f1-score   support
+
+         0.0       0.86      0.80      0.83   2704803
+         1.0       0.88      0.92      0.90   4314051
+
+    accuracy                           0.87   7018854
+   macro avg       0.87      0.86      0.86   7018854
+weighted avg       0.87      0.87      0.87   7018854
+
+[[2168549  536254]
+ [ 364334 3949717]]
+
+roc=0.9421431769028902
+
+
+XGBoostClassifier - max_depth=8, 500 estimators, slower
+========================================================
+
+              precision    recall  f1-score   support
+
+         0.0       0.88      0.84      0.86   2704803
+         1.0       0.90      0.93      0.92   4314051
+
+    accuracy                           0.89   7018854
+   macro avg       0.89      0.88      0.89   7018854
+weighted avg       0.89      0.89      0.89   7018854
+
+[[2271541  433262]
+ [ 304510 4009541]]
+
+roc=0.959909106387729
+```
+
+![img](./0135_boosting_roc.png)
+"""
+
+# %% [markdown]
+"""
+### Progress towards these results
+
+#### Small context, tried fine-tuning:
+
+![img](./0127_tuned_bad.png)
+
+#### MFCCs and bad scaling:
+
+![img](./0128_features_bad.png)
+
+#### Large context with certain weights scaled badly, obliterating the decision function:
+
+![img](./0129_large_context_weights_bad.png)
+
+#### Isolated well-scaled features to analyze the decision function:
+
+![img](./0130_large_context_removed_energy_look_at_decision_func.png)
+![img](./0131_large_context_removed_energy_look_at_decision_func.png)
+
+#### First successful model with large context, slightly underfitted for speech:
+
+![img](./0131_baseline.png)
+![img](./0132_baseline.png)
+
+#### Second successful model with large context and boosting, slightly overfitted for speech:
+
+![img](./0133_boosting.png)
+![img](./0134_boosting.png)
+"""
+
+# %% [markdown]
+"""
+### Model saving.
+"""
+
+# %%
+import pickle  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
+    pickle.dump(
+        {
+            "pipeline": pipeline,
+            "comment": (
+                "XGBClassifier with 500 estimators, max depth 8, "
+                "roc_auc_score 0.95 on test set"
+            ),
+        },
+        f,
+    )
+
+# %%
+import pickle  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+with open(f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl", "wb") as f:
+    pickle.dump(
+        {
+            "scaler": scaler,
+            "classifier": models,
+            "comment": (
+                "TODO"
+            ),
+        },
+        f,
+    )
+
+# %% [markdown]
+"""
+### Model loading.
+"""
+
+# %%
+import pickle
+
+with open("model_20260205_223523.pkl", "rb") as f:
     saved_data = pickle.load(f)
     scaler = saved_data["scaler"]
     models = saved_data["classifier"]
     print(saved_data["comment"])
 
 # %%
-pmeta = DatasetMeta(
-    dataset_name="mix_private_telephony",
-    datasets_meta=datasets_meta,
-    dataset_mask=(
-        dataset_metas["mix_private_telephony"].dataset_meta["Slug"]
-        == "mix_private_telephony/synthetic/audio_file_634.wav"
-    ),
-    print_stats=True,
-)
+import pickle
 
-DatasetAudioPipeline(print_stats=True).process(
-    dataset_meta=pmeta,
-    dataset_loader=dataset_loader,
-    dataset_teacher=make_mix_dataset_teacher(),
-    dataset_feature_extractor=dataset_feature_extractor,
-)
+with open("model_20260206_022323.pkl", "rb") as f:
+    saved_data = pickle.load(f)
+    model = saved_data["pipeline"]
+    print(saved_data["comment"])
+
+# %% [markdown]
+"""
+### Predictors.
+
+The following predictors are defined for evaluation:
+1. `BaseOfflineSGDPredictor` for the `SGDClassifier` models.
+2. `OfflineXGBoostPredictor` for the `XGBClassifier` model.
+
+The predictors take care of the feature computation and scaling before making predictions. They can also print statistics about the predictions if needed.
+"""
 
 # %%
-from time import time  # noqa: E402
-
-s0 = time()
-
 predictor = BaseOfflineSGDPredictor(
-    model=SGDEnsembleModel(models=models),
-    # model=SGDClassifierModel(model=models[2]),
-    scaler=rscaler,
+    # Some other variants of models that can be used for prediction:
+    # model=SGDEnsembleModel(models=models),
+    # model=SGDClassifierModel(model=models[4]),
+    model=model,
+    scaler=scaler,
     feature_compute=feature_compute_selector,
     print_stats=False,
 )
 
 # %%
-predicted = []
-for dataset_meta, X, y, meta in to_predict:
-    t0 = time()
-    predicted.append(predictor.predict(audio_data=meta.audio_data))
+predictor = OfflineXGBoostPredictor(
+    model=model,
+    feature_compute=feature_compute_selector,
+    print_stats=False,
+)
 
-    print(f"Predicted in {time() - t0:.3f}s.")
-    print(
-        f"{dataset_meta.dataset_name}: "
-        f"Sample {meta.samples_index + 1}/"
-        f"{meta.samples_total} ",
-    )
-print(f"Total prediction time: {time() - s0:.3f}s.")
+# %% [markdown]
+"""
+### Visualizers.
 
+The following visualizers are defined for visualizing the audio data, teacher probabilities, and predicted probabilities:
+1. `StaticPlotAudioVisualizer` using Matplotlib for static plots.
+2. `InteractivePlotAudioVisualizer` using Plotly for interactive plots.
+3. `InteractiveScaledFeatureVisualizer` for visualizing scaled feature vectors in an interactive manner.
+"""
 
 # %%
 class AbstractAudioVisualizer(AbstractVisualizer):
@@ -3296,19 +3915,6 @@ class InteractiveFeatureVisualizer(AbstractAudioVisualizer):
             "LogEnergy",
         ]
 
-        colors = [
-            "blue",
-            "orange",
-            "green",
-            "brown",
-            "purple",
-            "red",
-            "red",
-            "red",
-            "blue",
-            "yellow",
-        ]
-
         assert n_raw_feat == len(feature_names), (
             f"Expected {len(feature_names)} raw features, got {n_raw_feat}"
         )
@@ -3324,108 +3930,6 @@ class InteractiveFeatureVisualizer(AbstractAudioVisualizer):
         frame_duration = self._audio_data.chunk_size / sr
         t_audio = np.arange(len(audio)) / sr
         t_frames = np.arange(n_frames) * frame_duration
-
-        # ---- figure layout ----
-        # fig = make_subplots(
-        #     rows=n_raw_feat + 1,
-        #     cols=1,
-        #     shared_xaxes=True,
-        #     vertical_spacing=0.02,
-        #     subplot_titles=["Waveform"] + feature_names,
-        #     specs=[[{}]] + [[{"secondary_y": True}] for _ in range(n_raw_feat)],
-        # )
-        #
-        # # ---- waveform ----
-        # fig.add_trace(
-        #     go.Scatter(
-        #         x=t_audio,
-        #         y=audio,
-        #         mode="lines",
-        #         name="Waveform",
-        #         line=dict(color="black", width=1),
-        #     ),
-        #     row=1,
-        #     col=1,
-        # )
-        #
-        # # ---- feature plots ----
-        # for i, name, color in zip(range(n_raw_feat), feature_names, colors):
-        #     # ---- waveform ----
-        #     fig.add_trace(
-        #         go.Scatter(
-        #             x=t_audio,
-        #             y=audio,
-        #             mode="lines",
-        #             name="Waveform",
-        #             line=dict(color="black", width=1),
-        #             opacity=0.2,
-        #         ),
-        #         row=i + 2,
-        #         col=1,
-        #         secondary_y=True,
-        #     )
-        #
-        #     # raw feature
-        #     fig.add_trace(
-        #         go.Scatter(
-        #             x=t_frames,
-        #             y=raw_feat[:, i],
-        #             mode="lines",
-        #             name=f"{name} (raw)",
-        #             line=dict(width=1, dash="dash", color=color),
-        #             opacity=0.3,
-        #         ),
-        #         row=i + 2,
-        #         col=1,
-        #         secondary_y=False,
-        #     )
-        #
-        #     # context mean (scaled)
-        #     fig.add_trace(
-        #         go.Scatter(
-        #             x=t_frames,
-        #             y=ctx_feat[:, i],
-        #             mode="lines",
-        #             name=f"{name} (ctx mean, scaled)",
-        #             line=dict(width=1, color=color),
-        #         ),
-        #         row=i + 2,
-        #         col=1,
-        #         secondary_y=False,
-        #     )
-        #
-        #     var_col = n_raw_feat + i
-        #     fig.add_trace(
-        #         go.Scatter(
-        #             x=t_frames,
-        #             y=ctx_feat[:, var_col],
-        #             mode="lines",
-        #             name=f"{name} (ctx var)",
-        #             line=dict(width=1, dash="dot", color="red"),
-        #             opacity=0.7,
-        #         ),
-        #         row=i + 2,
-        #         col=1,
-        #         secondary_y=True,
-        #     )
-        #
-        # fig.update_layout(
-        #     height=250 * (n_raw_feat + 1),
-        #     xaxis_title="Time (s)",
-        #     title="Raw Features vs Context-Aggregated (Scaled) Features",
-        #     legend=dict(
-        #         orientation="h",
-        #         yanchor="bottom",
-        #         y=1.01,
-        #         xanchor="left",
-        #         x=0.01,
-        #     ),
-        # )
-        #
-        # fig.update_yaxes(title_text="Feature Value", secondary_y=False)
-        # fig.update_yaxes(title_text="Amplitude / Varience", secondary_y=True)
-        #
-        # fig.show()
 
         feature_names_selected = [
             "Mean ZCR",
@@ -3579,197 +4083,14 @@ class AudioVisualizer(AbstractAudioVisualizer):
             visualizer.show()
 
 
-# %%
-for i, audio_data in enumerate(predicted):
-    print(f"Sample {i}: {audio_data.file_path}")
+# %% [markdown]
+"""
+### Local audio data visualization.
 
-# %%
-audio_data = predicted[0]
+The next cell demonstrates the visualization of a single audio file from the dataset, showing the waveform, teacher probabilities, and predicted probabilities (if available). It also visualizes the selected context-aggregated features.
 
-feature_compute_ctx.reset()
-X = np.array(
-    [
-        feature_compute_ctx.compute(feat_vec=feat_vec)
-        for feat_vec in audio_data.feat_vectors
-    ],
-    dtype=np.float32,
-)
-feature_compute_ctx.reset()
-
-visualizer = AudioVisualizer(
-    StaticPlotAudioVisualizer(audio_data=audio_data),
-    InteractivePlotAudioVisualizer(audio_data=audio_data),
-    # InteractiveFeatureVisualizer(audio_data=audio_data),
-    InteractiveScaledFeatureVisualizer(
-        audio_data=audio_data,
-        scaled_feat_vectors=scaler.transform(X),
-    ),
-    PlayerWidgetAudioVisualizer(audio_data=audio_data),
-)
-
-visualizer.show()
-
-# %%
-audio_data = AudioData(
-    file_path="./audio_file_713.wav",
-    target_sr=8000,
-    chunk_size=int(0.01 * 8000),  # 10 ms chunks
-)
-
-audio_data = AudioLoader(print_stats=True).load(audio_data=audio_data)
-audio_data = SileroProbabilityTeacher(print_stats=True).teach(
-    audio_data=audio_data,
-)
-
-
-audio_data = AudioFeatureExtractor(print_stats=True).extract(
-    audio_data=audio_data, frame_generator=AudioFrameGenerator()
-)
-
-audio_data = predictor.predict(audio_data=audio_data)
-
-# replace peaks with peaks variance
-# replace tonality with tonality variance
-# replace centroid with centroid variance
-# remove all other variance
-
-assert audio_data.feat_vectors is not None
-print(f"Visualizing sample: {audio_data.file_path}")
-
-feature_compute_ctx.reset()
-X = np.array(
-    [
-        feature_compute_ctx.compute(feat_vec=feat_vec)
-        for feat_vec in audio_data.feat_vectors
-    ],
-    dtype=np.float32,
-)
-feature_compute_ctx.reset()
-
-feature_compute_selector.reset()
-X_selected = np.array(
-    [
-        feature_compute_selector.compute(feat_vec=feat_vec)
-        for feat_vec in audio_data.feat_vectors
-    ],
-    dtype=np.float32,
-)
-feature_compute_selector.reset()
-
-corr = np.corrcoef(X_selected, rowvar=False)
-
-feature_names = list(feature_compute_selector.selection.keys())
-print(feature_names)
-
-for i in range(len(feature_names)):
-    for j in range(i + 1, len(feature_names)):
-        c = corr[i, j]
-        if abs(c) > 0.8:
-            print(f"{feature_names[i]:20s} <-> {feature_names[j]:20s} : {c:.3f}")
-# %%
-for model in models:
-    print(model.coef_)
-    print(model.intercept_)
-# %%
-audio_data = predictor.predict(audio_data=audio_data)
-
-# from sklearn.preprocessing import RobustScaler
-rrscaler = RobustScaler()
-sscaler = StandardScaler()
-
-visualizer = AudioVisualizer(
-    StaticPlotAudioVisualizer(audio_data=audio_data),
-    InteractivePlotAudioVisualizer(audio_data=audio_data),
-    # InteractiveFeatureVisualizer(audio_data=audio_data),
-    InteractiveFeatureVisualizer(
-        audio_data=audio_data,
-        scaled_ctx_feat_vectors=X,
-        selected_ctx_feat_vectors=sscaler.fit_transform(X_selected),
-    ),
-    PlayerWidgetAudioVisualizer(audio_data=audio_data),
-)
-
-visualizer.show()
-del visualizer
-
-# %%
-audio_data = AudioData(
-    file_path="./audio_file_713.wav",
-    target_sr=8000,
-    chunk_size=int(0.01 * 8000),  # 10 ms chunks
-)
-
-audio_data = AudioLoader(print_stats=True).load(audio_data=audio_data)
-audio_data = SileroProbabilityTeacher(print_stats=True).teach(
-    audio_data=audio_data,
-)
-
-# - var flux
-# - var all energy
-# - var dfr
-# - var flatness
-
-
-audio_data = AudioFeatureExtractor(print_stats=True).extract(
-    audio_data=audio_data, frame_generator=AudioFrameGenerator()
-)
-
-# audio_data = predictor.predict(audio_data=audio_data)
-
-# replace peaks with peaks variance
-# replace tonality with tonality variance
-# replace centroid with centroid variance
-# remove all other variance
-
-assert audio_data.feat_vectors is not None
-print(f"Visualizing sample: {audio_data.file_path}")
-
-feature_compute_ctx.reset()
-X = np.array(
-    [
-        feature_compute_ctx.compute(feat_vec=feat_vec)
-        for feat_vec in audio_data.feat_vectors
-    ],
-    dtype=np.float32,
-)
-feature_compute_ctx.reset()
-
-feature_compute_selector.reset()
-X_selected = np.array(
-    [
-        feature_compute_selector.compute(feat_vec=feat_vec)
-        for feat_vec in audio_data.feat_vectors
-    ],
-    dtype=np.float32,
-)
-feature_compute_selector.reset()
-
-
-corr = np.corrcoef(X_selected, rowvar=False)
-
-feature_names = list(feature_compute_selector.selection.keys())
-print(feature_names)
-
-for i in range(len(feature_names)):
-    for j in range(i + 1, len(feature_names)):
-        c = corr[i, j]
-        if abs(c) > 0.8:
-            print(f"{feature_names[i]:20s} <-> {feature_names[j]:20s} : {c:.3f}")
-
-visualizer = AudioVisualizer(
-    StaticPlotAudioVisualizer(audio_data=audio_data),
-    InteractivePlotAudioVisualizer(audio_data=audio_data),
-    # InteractiveFeatureVisualizer(audio_data=audio_data),
-    InteractiveFeatureVisualizer(
-        audio_data=audio_data,
-        scaled_ctx_feat_vectors=X,
-        selected_ctx_feat_vectors=X_selected,
-    ),
-    PlayerWidgetAudioVisualizer(audio_data=audio_data),
-)
-
-visualizer.show()
-del visualizer
+Modify the `file_path` in the `AudioData` initialization to visualize different audio samples from the dataset. The visualizer will display static and interactive plots of the audio data and features, as well as an audio player widget for listening to the sample.
+"""
 
 # %%
 audio_data = AudioData(
@@ -3782,6 +4103,7 @@ audio_data = AudioLoader(print_stats=True).load(audio_data=audio_data)
 audio_data = SileroProbabilityTeacher(print_stats=True).teach(
     audio_data=audio_data,
 )
+
 audio_data = AudioFeatureExtractor(print_stats=True).extract(
     audio_data=audio_data, frame_generator=AudioFrameGenerator()
 )
@@ -3789,56 +4111,135 @@ audio_data = AudioFeatureExtractor(print_stats=True).extract(
 assert audio_data.feat_vectors is not None
 print(f"Visualizing sample: {audio_data.file_path}")
 
+feature_compute_ctx.reset()
+X = np.array(
+    [
+        feature_compute_ctx.compute(feat_vec=feat_vec)
+        for feat_vec in audio_data.feat_vectors
+    ],
+    dtype=np.float32,
+)
+feature_compute_ctx.reset()
+
+feature_compute_selector.reset()
+X_selected = np.array(
+    [
+        feature_compute_selector.compute(feat_vec=feat_vec)
+        for feat_vec in audio_data.feat_vectors
+    ],
+    dtype=np.float32,
+)
+feature_compute_selector.reset()
+
+corr = np.corrcoef(X_selected, rowvar=False)
+
+feature_names = list(feature_compute_selector.selection.keys())
+print(feature_names)
+
+for i in range(len(corr)):
+    for j in range(i + 1, len(corr[i])):
+        c = corr[i, j]
+        if abs(c) > 0.8:
+            print(f"{feature_names[i]:20s} <-> {feature_names[j]:20s} : {c:.3f}")
+
+# %%
+for model in models:
+    print(model.coef_)
+    print(model.intercept_)
+
+# %%
+audio_data = predictor.predict(audio_data=audio_data)
+
 visualizer = AudioVisualizer(
     StaticPlotAudioVisualizer(audio_data=audio_data),
     InteractivePlotAudioVisualizer(audio_data=audio_data),
-    # InteractiveFeatureVisualizer(audio_data=audio_data),
-    InteractiveScaledFeatureVisualizer(
+    InteractiveFeatureVisualizer(
         audio_data=audio_data,
-        scaled_feat_vectors=StdScaler().fit_transform(audio_data.feat_vectors),
+        scaled_ctx_feat_vectors=X,
+        selected_ctx_feat_vectors=scaler.transform(X_selected),
     ),
     PlayerWidgetAudioVisualizer(audio_data=audio_data),
 )
 
 visualizer.show()
+del visualizer
 
 # %% [markdown]
 """
-### Datasets
+### Random samples visualization.
 
-Non-speech:
-
-1. ~[UrbanSound8K](https://soundata.readthedocs.io/en/latest/source/quick_reference.html): A dataset containing 8,732 labeled sound excerpts (<=4s) of urban sounds from 10 classes, such as air conditioner, car horn, children playing, dog bark, drilling, engine idling, gunshot, jackhammer, siren, and street music.~
-2. [ESC-50](https://github.com/karolpiczak/ESC-50): A labeled collection of 2,000 environmental audio recordings (5s) organized into 50 classes, including animals, natural soundscapes, human non-speech sounds, interior/domestic sounds, and exterior/urban noises.
-3. ~[TAU NIGENS SSE 2021](https://soundata.readthedocs.io/en/latest/source/quick_reference.html): Spatial sound-scene recordings, consisting of sound events of distinct categories in a variety of acoustical spaces, and from multiple source directions and distances, at varying signal-to-noise ratios (SNR) ranging from noiseless (30dB) to noisy (6dB) conditions.~
-
-Speech (clean, noisy):
-
-1. ~[LibriSpeech Clean](https://www.openslr.org/12): 100 hours of clean read English speech derived from audiobooks from the LibriVox project, suitable for training and evaluating speech recognition systems.~
-2. [Callhome German](https://huggingface.co/datasets/talkbank/callhome): A dataset of telephone conversations in German.
-3. [VoxConverse test](https://github.com/joonson/voxconverse): A dataset for speaker diarization in real-world scenarios, containing multi-speaker conversations with overlapping speech and background noise.
-
-Speech and non-speech:
-
-1. [AVA-Speech for VAD](https://huggingface.co/datasets/nccratliri/vad-human-ava-speech): AVA-Speech dataset customized for Human Speech Voice Activity Detection in WhisperSeg. The audio files were extracted from films.
-2. [MUSAN](https://huggingface.co/datasets/FluidInference/musan): A corpus of music, speech, and noise recordings suitable for training and evaluating voice activity detection (VAD) systems.
-3. Private telephony: A collection of telephony audio recordings containing both speech and non-speech segments, used for training and evaluating VAD systems in telecommunication applications.
-
-### Training
-
-Take all or a portion of each dataset for training.
-
-### Testing
-
-Take a portion from private telephony dataset not used in training.
-2. [MUSAN](https://huggingface.co/datasets/FluidInference/musan): A corpus of music, speech, and noise recordings suitable for training and evaluating voice activity detection (VAD) systems.
-3. Private telephony: A collection of telephony audio recordings containing both speech and non-speech segments, used for training and evaluating VAD systems in telecommunication applications.
-
-### Training
-
-Take all or a portion of each dataset for training.
-
-### Testing
-
-Take a portion from private telephony dataset not used in training.
+The next cell randomly selects a few audio samples from the datasets and visualizes them using the defined visualizers. This allows you to explore different samples and see how the model's predictions compare to the teacher probabilities across various audio files.
 """
+
+# %%
+import random  # noqa: E402
+
+sample_dataset_names = random.sample(datasets_meta.dataset_names, k=3)
+for dataset_name in sample_dataset_names:
+    dataset_meta = dataset_metas[dataset_name]
+    print(f"\nShowing metadata for '{dataset_name}' dataset:")
+    dataset_meta.show()
+
+    print("Showing audio player for 2 random samples:")
+    sample_slugs = random.sample(
+        dataset_meta.dataset_meta["Slug"].tolist(),
+        k=min(2, len(dataset_meta.dataset_meta)),
+    )
+
+    for slug in sample_slugs:
+        file_path = datasets_meta.datasets_path / slug
+
+        audio_data = AudioData(
+            file_path=file_path.as_posix(),
+            target_sr=8000,
+            chunk_size=int(0.01 * 8000),  # 10 ms chunks
+        )
+
+        audio_data = AudioLoader(print_stats=True).load(audio_data=audio_data)
+        audio_data = UnthresholdedSileroProbabilityTeacher(print_stats=True).teach(
+            audio_data=audio_data,
+        )
+
+        audio_data = AudioFeatureExtractor(print_stats=True).extract(
+            audio_data=audio_data, frame_generator=AudioFrameGenerator()
+        )
+
+        audio_data = predictor.predict(audio_data=audio_data)
+
+        assert audio_data.feat_vectors is not None
+        print(f"Visualizing sample: {audio_data.file_path}")
+
+        feature_compute_ctx.reset()
+        X = np.array(
+            [
+                feature_compute_ctx.compute(feat_vec=feat_vec)
+                for feat_vec in audio_data.feat_vectors
+            ],
+            dtype=np.float32,
+        )
+        feature_compute_ctx.reset()
+
+        feature_compute_selector.reset()
+        X_selected = np.array(
+            [
+                feature_compute_selector.compute(feat_vec=feat_vec)
+                for feat_vec in audio_data.feat_vectors
+            ],
+            dtype=np.float32,
+        )
+        feature_compute_selector.reset()
+
+        visualizer = AudioVisualizer(
+            StaticPlotAudioVisualizer(audio_data=audio_data),
+            InteractivePlotAudioVisualizer(audio_data=audio_data),
+            # InteractiveFeatureVisualizer(audio_data=audio_data),
+            # InteractiveFeatureVisualizer(
+            #     audio_data=audio_data,
+            #     scaled_ctx_feat_vectors=X,
+            #     selected_ctx_feat_vectors=scaler.transform(X_selected),
+            # ),
+            PlayerWidgetAudioVisualizer(audio_data=audio_data),
+        )
+
+        visualizer.show()
+        del visualizer

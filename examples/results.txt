@@ -1,0 +1,114 @@
+SGDClasifier - baseline, log_loss.
+
+              precision    recall  f1-score   support
+
+         0.0       0.78      0.64      0.70  13524017
+         1.0       0.80      0.88      0.84  21570252
+
+    accuracy                           0.79  35094269
+   macro avg       0.79      0.76      0.77  35094269
+weighted avg       0.79      0.79      0.78  35094269
+
+[[ 8644813  4879204]
+ [ 2505718 19064534]]
+
+0.845849912069585
+
+SGDClasifier - log_loss, robust scaler
+
+              precision    recall  f1-score   support
+
+         0.0       0.77      0.64      0.70  13524017
+         1.0       0.80      0.88      0.84  21570252
+
+    accuracy                           0.79  35094269
+   macro avg       0.79      0.76      0.77  35094269
+weighted avg       0.79      0.79      0.79  35094269
+
+[[ 8681900  4842117]
+ [ 2539345 19030907]]
+
+0.8458671814099122
+
+
+
+SGDClasifier - hinge, standard scaler
+
+              precision    recall  f1-score   support
+
+         0.0       0.79      0.63      0.70  13524017
+         1.0       0.79      0.89      0.84  21570252
+
+    accuracy                           0.79  35094269
+   macro avg       0.79      0.76      0.77  35094269
+weighted avg       0.79      0.79      0.79  35094269
+
+[[ 8499331  5024686]
+ [ 2301275 19268977]]
+
+
+ SGDClasifier - log_loss, l2, balanced class weight, standard scaler
+
+              precision    recall  f1-score   support
+
+         0.0       0.70      0.75      0.72  13524017
+         1.0       0.83      0.79      0.81  21570252
+
+    accuracy                           0.78  35094269
+   macro avg       0.77      0.77      0.77  35094269
+weighted avg       0.78      0.78      0.78  35094269
+
+[[10132205  3391812]
+ [ 4438565 17131687]]
+
+0.8459882135678315
+
+
+10 SGDClasifiers with soft voting.
+              precision    recall  f1-score   support
+
+         0.0       0.69      0.75      0.72  13524017
+         1.0       0.84      0.79      0.81  21570252
+
+    accuracy                           0.77  35094269
+   macro avg       0.76      0.77      0.77  35094269
+weighted avg       0.78      0.77      0.78  35094269
+
+[[10187874  3336143]
+ [ 4588512 16981740]]
+
+0.845650607462749
+
+
+
+XGBoostClassifier - max_depth=6
+
+              precision    recall  f1-score   support
+
+         0.0       0.86      0.80      0.83   2704803
+         1.0       0.88      0.92      0.90   4314051
+
+    accuracy                           0.87   7018854
+   macro avg       0.87      0.86      0.86   7018854
+weighted avg       0.87      0.87      0.87   7018854
+
+[[2168549  536254]
+ [ 364334 3949717]]
+
+0.9421431769028902
+
+
+XGBoostClassifier - max_depth=8, 500 estimators, slower
+              precision    recall  f1-score   support
+
+         0.0       0.88      0.84      0.86   2704803
+         1.0       0.90      0.93      0.92   4314051
+
+    accuracy                           0.89   7018854
+   macro avg       0.89      0.88      0.89   7018854
+weighted avg       0.89      0.89      0.89   7018854
+
+[[2271541  433262]
+ [ 304510 4009541]]
+
+0.959909106387729
